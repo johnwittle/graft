@@ -1,0 +1,964 @@
+#!/usr/bin/env python3
+"""
+graft - A conversation harness for the Anthropic API
+
+Manages persistent conversations with Claude, supporting save/load,
+prompt caching, and seamless context continuity.
+
+Usage: 
+  graft                          # Start new conversation or interactive menu
+  graft <name>                   # Load existing conversation by name
+  graft --import <file.json> [name] [--no-thinking] [--no-tool-use]
+                                 # Import from socketteer or API format
+  graft --list                   # List saved conversations
+
+Commands during conversation:
+  /save [name]    - Save conversation (prompts for name if new)
+  /load <name>    - Load a different conversation
+  /list           - Show saved conversations
+  /new            - Start fresh conversation
+  /rename <name>  - Rename current conversation
+  /delete <n>  - Delete a saved conversation
+  /read           - View full transcript in pager
+  /export [file]  - Export transcript to file
+  /cache on|off|5m|1h  - Control prompt caching
+  /model [name]   - Show or switch model
+  /web on|off     - Toggle web search
+  /tokens         - Show token estimates
+  /system [text]  - Set/show system prompt
+  /stats          - Show session statistics
+  /help           - Show commands
+  /quit           - Exit
+"""
+
+import json
+import sys
+import os
+import readline
+import atexit
+from pathlib import Path
+from datetime import datetime
+from anthropic import Anthropic
+
+# === Configuration ===
+
+GRAFT_DIR = Path.home() / ".graft"
+CONVERSATIONS_DIR = GRAFT_DIR / "conversations"
+CONFIG_PATH = GRAFT_DIR / "config.toml"
+HISTORY_PATH = GRAFT_DIR / "history"
+
+DEFAULT_CONFIG = {
+    "default_model": "claude-opus-4-5-20251101",
+    "cache_ttl": "5m",
+    "editing_mode": "emacs",
+    "max_tokens": 8192,
+    "web_search": False,
+}
+
+# === Setup Functions ===
+
+def ensure_graft_dirs():
+    """Create ~/.graft directory structure if needed."""
+    GRAFT_DIR.mkdir(exist_ok=True)
+    CONVERSATIONS_DIR.mkdir(exist_ok=True)
+
+def load_config():
+    """Load config from TOML file, with defaults."""
+    config = DEFAULT_CONFIG.copy()
+    
+    if CONFIG_PATH.exists():
+        try:
+            import tomllib
+        except ImportError:
+            # Python < 3.11 fallback - simple TOML parsing
+            for line in CONFIG_PATH.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip().strip('"\'')
+                    if key in config:
+                        config[key] = value
+            return config
+        
+        with open(CONFIG_PATH, 'rb') as f:
+            file_config = tomllib.load(f)
+            config.update(file_config)
+    
+    return config
+
+def save_default_config():
+    """Write default config if none exists."""
+    if not CONFIG_PATH.exists():
+        config_text = '''# graft configuration
+
+# Default model for new conversations
+default_model = "claude-opus-4-5-20251101"
+
+# Prompt cache TTL: "5m", "1h", or "off"
+cache_ttl = "5m"
+
+# Line editing mode: "vi" or "emacs"
+editing_mode = "emacs"
+
+# Maximum response tokens
+max_tokens = 8192
+
+# Enable web search by default: true or false
+# Costs $10 per 1,000 searches. Must be enabled in Anthropic Console.
+web_search = false
+'''
+        CONFIG_PATH.write_text(config_text)
+
+def setup_readline(config):
+    """Configure readline for line editing and history."""
+    # Set editing mode
+    if config.get('editing_mode', 'emacs').lower() == 'vi':
+        readline.parse_and_bind('set editing-mode vi')
+    else:
+        readline.parse_and_bind('set editing-mode emacs')
+    
+    # Load history
+    if HISTORY_PATH.exists():
+        try:
+            readline.read_history_file(HISTORY_PATH)
+        except Exception:
+            pass
+    
+    # Set history length
+    readline.set_history_length(1000)
+    
+    # Save history on exit
+    atexit.register(lambda: readline.write_history_file(HISTORY_PATH))
+
+def load_dotenv():
+    """Load .env file for API key."""
+    for env_path in [Path('.env'), Path.home() / '.env', GRAFT_DIR / '.env']:
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key.strip()] = value.strip().strip('"\'')
+            return
+
+# === Conversation Management ===
+
+def convert_socketteer_format(data, include_thinking=True, include_tool_use=True):
+    """
+    Convert socketteer Claude Conversation Exporter format to API messages.
+    
+    Handles:
+    - sender → role mapping
+    - Content block extraction (text, thinking, tool_use, tool_result)
+    - Merging consecutive same-role messages
+    
+    By default includes everything for full continuity.
+    """
+    messages = []
+    
+    for msg in data.get('chat_messages', []):
+        sender = msg.get('sender', '')
+        
+        # Map sender to API role
+        if sender == 'human':
+            role = 'user'
+        elif sender == 'assistant':
+            role = 'assistant'
+        else:
+            continue  # Skip unknown senders
+        
+        # Extract text content from content blocks
+        text_parts = []
+        
+        for block in msg.get('content', []):
+            block_type = block.get('type', '')
+            
+            if block_type == 'text':
+                text = block.get('text', '')
+                if text:
+                    text_parts.append(text)
+            
+            elif block_type == 'thinking':
+                if include_thinking:
+                    thinking = block.get('thinking', '')
+                    if thinking:
+                        text_parts.append(f"[Thinking]\n{thinking}\n[/Thinking]")
+            
+            elif block_type == 'tool_use':
+                if include_tool_use:
+                    tool_name = block.get('name', 'unknown')
+                    tool_input = json.dumps(block.get('input', {}), indent=2)
+                    text_parts.append(f"[Tool: {tool_name}]\n{tool_input}")
+            
+            elif block_type == 'tool_result':
+                if include_tool_use:
+                    content = block.get('content', [])
+                    if isinstance(content, list) and content:
+                        first_item = content[0]
+                        if isinstance(first_item, dict):
+                            title = first_item.get('title', '')[:100]
+                            text_parts.append(f"[Tool Result: {title}...]")
+        
+        # Combine text parts
+        combined_text = '\n\n'.join(text_parts)
+        
+        if combined_text.strip():
+            messages.append({
+                'role': role,
+                'content': combined_text
+            })
+    
+    # Merge consecutive messages with same role (API requirement)
+    merged = []
+    for msg in messages:
+        if merged and merged[-1]['role'] == msg['role']:
+            merged[-1]['content'] += '\n\n' + msg['content']
+        else:
+            merged.append(msg)
+    
+    return merged
+
+class Conversation:
+    """Manages a single conversation's state and metadata."""
+    
+    def __init__(self, name=None):
+        self.name = name
+        self.messages = []
+        self.created = datetime.now().isoformat()
+        self.modified = self.created
+        self.model = None  # Set from config if not loaded
+        self.system_prompt = ""
+        self.unsaved_changes = False
+    
+    @classmethod
+    def load(cls, name):
+        """Load conversation from ~/.graft/conversations/<name>.json"""
+        path = CONVERSATIONS_DIR / f"{name}.json"
+        if not path.exists():
+            raise FileNotFoundError(f"No conversation named '{name}'")
+        
+        data = json.loads(path.read_text(encoding='utf-8'))
+        
+        conv = cls(name=data.get('name', name))
+        conv.messages = data.get('messages', [])
+        conv.created = data.get('created', datetime.now().isoformat())
+        conv.modified = data.get('modified', conv.created)
+        conv.model = data.get('model')
+        conv.system_prompt = data.get('system_prompt', "")
+        conv.unsaved_changes = False
+        
+        return conv
+    
+    @classmethod
+    def from_import(cls, path, name=None, include_thinking=True, include_tool_use=True):
+        """
+        Import conversation from various formats:
+        - socketteer export (has 'chat_messages')
+        - json_to_api.py output (has 'messages' + 'metadata')
+        - raw API messages array
+        
+        By default, includes thinking blocks and tool use for full continuity.
+        Use --no-thinking or --no-tool-use to exclude.
+        """
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        
+        # Detect format and convert
+        if isinstance(data, dict) and 'chat_messages' in data:
+            # Socketteer format - needs conversion
+            messages = convert_socketteer_format(data, include_thinking, include_tool_use)
+            default_name = data.get('name', 'imported')
+            source_model = data.get('model')
+        elif isinstance(data, dict) and 'messages' in data:
+            # Already API format (from json_to_api.py or graft save)
+            messages = data['messages']
+            metadata = data.get('metadata', {})
+            default_name = metadata.get('source_name', data.get('name', 'imported'))
+            source_model = metadata.get('source_model', data.get('model'))
+        elif isinstance(data, list):
+            # Raw messages array
+            messages = data
+            default_name = 'imported'
+            source_model = None
+        else:
+            raise ValueError("Unrecognized conversation format")
+        
+        conv = cls(name=name or default_name)
+        conv.messages = messages
+        conv.model = source_model
+        conv.unsaved_changes = True
+        
+        return conv
+    
+    def save(self, new_name=None):
+        """Save conversation to ~/.graft/conversations/<name>.json"""
+        if new_name:
+            self.name = new_name
+        
+        if not self.name:
+            raise ValueError("Conversation needs a name to save")
+        
+        self.modified = datetime.now().isoformat()
+        
+        data = {
+            'name': self.name,
+            'created': self.created,
+            'modified': self.modified,
+            'model': self.model,
+            'system_prompt': self.system_prompt,
+            'messages': self.messages,
+        }
+        
+        path = CONVERSATIONS_DIR / f"{self.name}.json"
+        path.write_text(json.dumps(data, indent=2), encoding='utf-8')
+        self.unsaved_changes = False
+        
+        return path
+    
+    def token_estimate(self):
+        """Rough token count estimate."""
+        total = 0
+        for m in self.messages:
+            content = m.get('content', '')
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and 'text' in block:
+                        total += len(block['text'])
+        return total // 4
+
+def list_conversations():
+    """Return list of saved conversations with metadata."""
+    convos = []
+    for path in sorted(CONVERSATIONS_DIR.glob('*.json')):
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            messages = data.get('messages', [])
+            convos.append({
+                'name': path.stem,
+                'modified': data.get('modified', 'unknown'),
+                'messages': len(messages),
+                'model': data.get('model', 'unknown'),
+            })
+        except Exception as e:
+            convos.append({
+                'name': path.stem,
+                'error': str(e),
+            })
+    return convos
+
+def format_conversation_list(convos):
+    """Format conversation list for display."""
+    if not convos:
+        return "No saved conversations."
+    
+    lines = []
+    for c in convos:
+        if 'error' in c:
+            lines.append(f"  {c['name']} (error: {c['error']})")
+        else:
+            # Parse and format the date
+            try:
+                dt = datetime.fromisoformat(c['modified'])
+                date_str = dt.strftime('%Y-%m-%d %H:%M')
+            except:
+                date_str = c['modified'][:16] if len(c['modified']) > 16 else c['modified']
+            
+            lines.append(f"  {c['name']:<30} {c['messages']:>4} msgs  {date_str}")
+    
+    return '\n'.join(lines)
+
+# === Transcript Formatting ===
+
+def format_message(msg, width=80):
+    """Format a single message for display."""
+    role = msg.get('role', 'unknown')
+    content = msg.get('content', '')
+    
+    # Handle block-format content
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and 'text' in block:
+                text_parts.append(block['text'])
+        content = '\n\n'.join(text_parts)
+    
+    # Format role header
+    if role == 'user':
+        header = "You:"
+    elif role == 'assistant':
+        header = "Claude:"
+    else:
+        header = f"{role.title()}:"
+    
+    return f"{header}\n{content}"
+
+def format_transcript(messages, last_n=None):
+    """Format messages as human-readable transcript."""
+    if last_n:
+        messages = messages[-last_n:]
+    
+    parts = []
+    for msg in messages:
+        parts.append(format_message(msg))
+    
+    separator = "\n\n" + ("-" * 40) + "\n\n"
+    return separator.join(parts)
+
+def show_in_pager(text):
+    """Display text in a pager (less) if available, otherwise print."""
+    import subprocess
+    import shutil
+    
+    # Try to find a pager
+    pager = shutil.which('less') or shutil.which('more')
+    
+    if pager:
+        try:
+            proc = subprocess.Popen([pager], stdin=subprocess.PIPE)
+            proc.communicate(input=text.encode('utf-8'))
+            return
+        except Exception:
+            pass
+    
+    # Fallback: just print
+    print(text)
+
+def show_recent_messages(messages, n=4):
+    """Print the last n messages as context."""
+    if not messages:
+        return
+    
+    recent = messages[-n:]
+    print("\n--- Recent context ---")
+    for msg in recent:
+        print()
+        print(format_message(msg))
+    print("\n" + "-" * 40)
+
+# === Prompt Caching ===
+
+def prepare_messages_for_cache(messages, cache_ttl="5m"):
+    """
+    Convert messages to cacheable format.
+    Adds cache_control to the second-to-last user message.
+    """
+    if cache_ttl == "off" or len(messages) < 2:
+        return messages
+    
+    # Build cache_control object based on TTL
+    if cache_ttl == "1h":
+        cache_control = {"type": "ephemeral", "ttl": 3600}
+    else:  # Default 5m
+        cache_control = {"type": "ephemeral"}
+    
+    prepared = []
+    
+    # Find the second-to-last user message index
+    user_indices = [i for i, m in enumerate(messages) if m['role'] == 'user']
+    cache_index = user_indices[-2] if len(user_indices) >= 2 else -1
+    
+    for i, msg in enumerate(messages):
+        content = msg['content']
+        
+        # Convert string content to block format if needed
+        if isinstance(content, str):
+            if i == cache_index:
+                content = [{
+                    "type": "text",
+                    "text": content,
+                    "cache_control": cache_control
+                }]
+            else:
+                content = [{"type": "text", "text": content}]
+        elif isinstance(content, list) and i == cache_index:
+            content = content.copy()
+            if content and isinstance(content[-1], dict):
+                content[-1] = {**content[-1], "cache_control": cache_control}
+        
+        prepared.append({"role": msg['role'], "content": content})
+    
+    return prepared
+
+# === Main REPL ===
+
+class GraftSession:
+    """Main session manager."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.conversation = None
+        self.client = None
+        self.cache_ttl = config.get('cache_ttl', '5m')
+        # Handle web_search config - can be bool or string
+        ws = config.get('web_search', False)
+        self.web_search_enabled = ws if isinstance(ws, bool) else str(ws).lower() in ('true', '1', 'yes', 'on')
+        self.stats = {
+            'cache_creation_input_tokens': 0,
+            'cache_read_input_tokens': 0,
+            'total_input_tokens': 0,
+            'total_output_tokens': 0,
+            'requests': 0,
+            'web_searches': 0,
+        }
+    
+    def init_client(self):
+        """Initialize Anthropic client."""
+        api_key = os.environ.get('ANTHROPIC_API_KEY')
+        if not api_key:
+            print("Error: ANTHROPIC_API_KEY not found")
+            print("Set it in one of: ./.env, ~/.env, ~/.graft/.env")
+            sys.exit(1)
+        self.client = Anthropic(api_key=api_key)
+    
+    def new_conversation(self):
+        """Start a fresh conversation."""
+        if self.conversation and self.conversation.unsaved_changes:
+            resp = input("Current conversation has unsaved changes. Discard? [y/N] ").strip().lower()
+            if resp != 'y':
+                return False
+        
+        self.conversation = Conversation()
+        self.conversation.model = self.config.get('default_model')
+        self.stats = {k: 0 for k in self.stats}
+        print("Started new conversation.")
+        return True
+    
+    def load_conversation(self, name):
+        """Load a conversation by name."""
+        if self.conversation and self.conversation.unsaved_changes:
+            resp = input("Current conversation has unsaved changes. Discard? [y/N] ").strip().lower()
+            if resp != 'y':
+                return False
+        
+        try:
+            self.conversation = Conversation.load(name)
+            if not self.conversation.model:
+                self.conversation.model = self.config.get('default_model')
+            self.stats = {k: 0 for k in self.stats}
+            print(f"Loaded '{name}' ({len(self.conversation.messages)} messages, ~{self.conversation.token_estimate():,} tokens)")
+            
+            # Show recent context
+            if self.conversation.messages:
+                show_recent_messages(self.conversation.messages, n=4)
+            
+            return True
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            return False
+    
+    def import_conversation(self, path, name=None, include_thinking=True, include_tool_use=True):
+        """Import from socketteer export or other formats. Includes all content by default."""
+        try:
+            self.conversation = Conversation.from_import(
+                path, name, 
+                include_thinking=include_thinking,
+                include_tool_use=include_tool_use
+            )
+            if not self.conversation.model:
+                self.conversation.model = self.config.get('default_model')
+            self.stats = {k: 0 for k in self.stats}
+            print(f"Imported {len(self.conversation.messages)} messages (~{self.conversation.token_estimate():,} tokens)")
+            if self.conversation.name:
+                print(f"Default name: '{self.conversation.name}' (use /save to confirm or /rename to change)")
+            return True
+        except Exception as e:
+            print(f"Import error: {e}")
+            return False
+    
+    def handle_command(self, cmd_line):
+        """Handle /commands. Returns True if should continue, False to quit."""
+        parts = cmd_line.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else None
+        
+        if cmd == '/quit' or cmd == '/exit':
+            if self.conversation and self.conversation.unsaved_changes:
+                resp = input("Unsaved changes. Quit anyway? [y/N] ").strip().lower()
+                if resp != 'y':
+                    return True
+            return False
+        
+        elif cmd == '/help':
+            print("""
+Commands:
+  /save [name]    - Save conversation
+  /load <name>    - Load conversation
+  /list           - Show saved conversations
+  /new            - Start fresh conversation
+  /rename <name>  - Rename current conversation
+  /cache on|off|5m|1h  - Control prompt caching
+  /delete <name>  - Delete a saved conversation
+  /read           - View full transcript in pager
+  /export [file]  - Export transcript to file
+  /model [name]   - Show or switch model
+  /web on|off     - Toggle web search
+  /tokens         - Show token estimate
+  /system [text]  - Set/show system prompt
+  /stats          - Show session statistics
+  /quit           - Exit
+""")
+        
+        elif cmd == '/save':
+            if not self.conversation:
+                print("No active conversation.")
+                return True
+            
+            name = arg
+            if not name and not self.conversation.name:
+                name = input("Conversation name: ").strip()
+                if not name:
+                    print("Save cancelled.")
+                    return True
+            
+            try:
+                path = self.conversation.save(name)
+                print(f"Saved to {path}")
+            except Exception as e:
+                print(f"Save error: {e}")
+        
+        elif cmd == '/load':
+            if not arg:
+                print("Usage: /load <name>")
+                return True
+            self.load_conversation(arg)
+        
+        elif cmd == '/list':
+            convos = list_conversations()
+            print(format_conversation_list(convos))
+        
+        elif cmd == '/new':
+            self.new_conversation()
+        
+        elif cmd == '/rename':
+            if not self.conversation:
+                print("No active conversation.")
+                return True
+            if not arg:
+                print("Usage: /rename <new-name>")
+                return True
+            old_name = self.conversation.name
+            self.conversation.name = arg
+            self.conversation.unsaved_changes = True
+            print(f"Renamed '{old_name or '(unnamed)'}' to '{arg}' (use /save to persist)")
+        
+        elif cmd == '/delete':
+            if not arg:
+                print("Usage: /delete <name>")
+                return True
+            
+            path = CONVERSATIONS_DIR / f"{arg}.json"
+            if not path.exists():
+                print(f"No conversation named '{arg}'")
+                return True
+            
+            # Don't allow deleting current conversation without confirmation
+            if self.conversation and self.conversation.name == arg:
+                resp = input(f"Delete current conversation '{arg}'? [y/N] ").strip().lower()
+            else:
+                resp = input(f"Delete '{arg}'? [y/N] ").strip().lower()
+            
+            if resp == 'y':
+                path.unlink()
+                print(f"Deleted '{arg}'")
+                # If we deleted the current conversation, clear it
+                if self.conversation and self.conversation.name == arg:
+                    self.conversation = None
+            else:
+                print("Cancelled.")
+        
+        elif cmd == '/read':
+            if not self.conversation or not self.conversation.messages:
+                print("No conversation to read.")
+                return True
+            
+            transcript = format_transcript(self.conversation.messages)
+            show_in_pager(transcript)
+        
+        elif cmd == '/export':
+            if not self.conversation or not self.conversation.messages:
+                print("No conversation to export.")
+                return True
+            
+            # Default filename based on conversation name
+            if arg:
+                filename = arg
+            elif self.conversation.name:
+                filename = f"{self.conversation.name}.txt"
+            else:
+                filename = "conversation.txt"
+            
+            transcript = format_transcript(self.conversation.messages)
+            Path(filename).write_text(transcript, encoding='utf-8')
+            print(f"Exported to {filename}")
+        
+        elif cmd == '/cache':
+            if not arg:
+                print(f"Current cache TTL: {self.cache_ttl}")
+                return True
+            
+            arg = arg.lower()
+            if arg in ('on', '5m'):
+                self.cache_ttl = '5m'
+                print("Cache: 5 minute TTL")
+            elif arg == '1h':
+                self.cache_ttl = '1h'
+                print("Cache: 1 hour TTL")
+            elif arg == 'off':
+                self.cache_ttl = 'off'
+                print("Cache: disabled")
+            else:
+                print("Usage: /cache on|off|5m|1h")
+        
+        elif cmd == '/web':
+            if not arg:
+                status = "enabled" if self.web_search_enabled else "disabled"
+                print(f"Web search: {status}")
+                return True
+            
+            arg = arg.lower()
+            if arg in ('on', 'true', 'yes', '1'):
+                self.web_search_enabled = True
+                print("Web search: enabled ($10/1000 searches)")
+            elif arg in ('off', 'false', 'no', '0'):
+                self.web_search_enabled = False
+                print("Web search: disabled")
+            else:
+                print("Usage: /web on|off")
+        
+        elif cmd == '/model':
+            if not arg:
+                model = self.conversation.model if self.conversation else self.config.get('default_model')
+                print(f"Current model: {model}")
+                return True
+            
+            if self.conversation:
+                self.conversation.model = arg
+                self.conversation.unsaved_changes = True
+            print(f"Model set to: {arg}")
+        
+        elif cmd == '/tokens':
+            if not self.conversation:
+                print("No active conversation.")
+                return True
+            print(f"Estimated tokens: ~{self.conversation.token_estimate():,}")
+        
+        elif cmd == '/system':
+            if not self.conversation:
+                print("No active conversation.")
+                return True
+            
+            if arg:
+                self.conversation.system_prompt = arg
+                self.conversation.unsaved_changes = True
+                print(f"System prompt set ({len(arg)} chars)")
+            else:
+                if self.conversation.system_prompt:
+                    print(f"System prompt: {self.conversation.system_prompt[:200]}{'...' if len(self.conversation.system_prompt) > 200 else ''}")
+                else:
+                    print("No system prompt set.")
+        
+        elif cmd == '/stats':
+            print(f"Session statistics ({self.stats['requests']} requests):")
+            print(f"  Total input tokens:  {self.stats['total_input_tokens']:,}")
+            print(f"  Total output tokens: {self.stats['total_output_tokens']:,}")
+            print(f"  Cache writes:        {self.stats['cache_creation_input_tokens']:,}")
+            print(f"  Cache reads:         {self.stats['cache_read_input_tokens']:,}")
+            if self.stats['total_input_tokens'] > 0:
+                rate = self.stats['cache_read_input_tokens'] / self.stats['total_input_tokens'] * 100
+                print(f"  Cache hit rate:      {rate:.1f}%")
+            if self.stats['web_searches'] > 0:
+                print(f"  Web searches:        {self.stats['web_searches']}")
+        
+        else:
+            print(f"Unknown command: {cmd} (try /help)")
+        
+        return True
+    
+    def send_message(self, user_input):
+        """Send a message and get response."""
+        if not self.conversation:
+            self.new_conversation()
+        
+        # Add user message
+        self.conversation.messages.append({"role": "user", "content": user_input})
+        self.conversation.unsaved_changes = True
+        
+        try:
+            print("\nClaude: ", end="", flush=True)
+            
+            # Prepare messages with cache control
+            prepared = prepare_messages_for_cache(
+                self.conversation.messages, 
+                self.cache_ttl
+            )
+            
+            # Build request
+            request_kwargs = {
+                "model": self.conversation.model,
+                "max_tokens": int(self.config.get('max_tokens', 8192)),
+                "messages": prepared,
+            }
+            if self.conversation.system_prompt:
+                request_kwargs["system"] = self.conversation.system_prompt
+            
+            # Add web search tool if enabled
+            if self.web_search_enabled:
+                request_kwargs["tools"] = [{
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 5,
+                }]
+            
+            response = self.client.messages.create(**request_kwargs)
+            
+            # Extract text
+            assistant_text = ""
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    assistant_text += block.text
+            
+            print(assistant_text)
+            
+            # Add to history
+            self.conversation.messages.append({"role": "assistant", "content": assistant_text})
+            
+            # Update stats
+            self.stats['requests'] += 1
+            if hasattr(response, 'usage'):
+                usage = response.usage
+                self.stats['total_input_tokens'] += usage.input_tokens
+                self.stats['total_output_tokens'] += usage.output_tokens
+                
+                cache_creation = getattr(usage, 'cache_creation_input_tokens', 0) or 0
+                cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
+                self.stats['cache_creation_input_tokens'] += cache_creation
+                self.stats['cache_read_input_tokens'] += cache_read
+                
+                # Track web searches
+                server_tool_use = getattr(usage, 'server_tool_use', None)
+                if server_tool_use:
+                    web_searches = getattr(server_tool_use, 'web_search_requests', 0) or 0
+                    self.stats['web_searches'] += web_searches
+                
+                # Show usage
+                cache_info = ""
+                if cache_creation > 0:
+                    cache_info = f", cache write: {cache_creation:,}"
+                elif cache_read > 0:
+                    cache_info = f", cache read: {cache_read:,}"
+                
+                web_info = ""
+                if server_tool_use and getattr(server_tool_use, 'web_search_requests', 0):
+                    web_info = f", web: {server_tool_use.web_search_requests}"
+                
+                print(f"\n[in: {usage.input_tokens:,}, out: {usage.output_tokens:,}{cache_info}{web_info}]")
+        
+        except Exception as e:
+            print(f"\nError: {e}")
+            # Rollback
+            self.conversation.messages.pop()
+    
+    def run(self):
+        """Main REPL loop."""
+        self.init_client()
+        
+        name = self.conversation.name if self.conversation else "(new)"
+        model = self.conversation.model if self.conversation else self.config.get('default_model')
+        web_status = "on" if self.web_search_enabled else "off"
+        
+        print(f"\ngraft - conversation: {name}")
+        print(f"model: {model}, cache: {self.cache_ttl}, web: {web_status}")
+        print("Type /help for commands\n" + "-" * 40)
+        
+        while True:
+            try:
+                prompt = f"\n[{self.conversation.name or 'new'}] You: "
+                user_input = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n")
+                if self.conversation and self.conversation.unsaved_changes:
+                    resp = input("Unsaved changes. Quit anyway? [y/N] ").strip().lower()
+                    if resp != 'y':
+                        continue
+                break
+            
+            if not user_input:
+                continue
+            
+            if user_input.startswith('/'):
+                if not self.handle_command(user_input):
+                    break
+            else:
+                self.send_message(user_input)
+
+# === Entry Point ===
+
+def main():
+    ensure_graft_dirs()
+    save_default_config()
+    load_dotenv()
+    
+    config = load_config()
+    setup_readline(config)
+    
+    session = GraftSession(config)
+    
+    # Parse command line
+    args = sys.argv[1:]
+    
+    if not args:
+        # Interactive: show menu or start new
+        convos = list_conversations()
+        if convos:
+            print("Saved conversations:")
+            print(format_conversation_list(convos))
+            print()
+            choice = input("Load conversation (name), or press Enter for new: ").strip()
+            if choice:
+                session.load_conversation(choice)
+            else:
+                session.new_conversation()
+        else:
+            session.new_conversation()
+    
+    elif args[0] == '--list':
+        convos = list_conversations()
+        print(format_conversation_list(convos))
+        return
+    
+    elif args[0] == '--import':
+        if len(args) < 2:
+            print("Usage: graft --import <file.json> [name] [--no-thinking] [--no-tool-use]")
+            sys.exit(1)
+        
+        # Parse import arguments - defaults are to INCLUDE everything
+        import_path = args[1]
+        import_name = None
+        include_thinking = '--no-thinking' not in args
+        include_tool_use = '--no-tool-use' not in args
+        
+        # Find name argument (first non-flag after path)
+        for arg in args[2:]:
+            if not arg.startswith('--'):
+                import_name = arg
+                break
+        
+        if not session.import_conversation(import_path, import_name, include_thinking, include_tool_use):
+            sys.exit(1)
+    
+    elif args[0].startswith('-'):
+        print(f"Unknown option: {args[0]}")
+        print("Usage: graft [name | --list | --import <file> [name]]")
+        sys.exit(1)
+    
+    else:
+        # Load by name
+        if not session.load_conversation(args[0]):
+            sys.exit(1)
+    
+    session.run()
+
+if __name__ == '__main__':
+    main()
