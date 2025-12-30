@@ -24,6 +24,7 @@ Commands during conversation:
   /cache on|off|5m|1h  - Control prompt caching
   /model [name]   - Show or switch model
   /web on|off     - Toggle web search
+  /tools [path]   - Enable file tools for a directory
   /tokens         - Show token estimates
   /system [text]  - Set/show system prompt
   /stats          - Show session statistics
@@ -481,6 +482,139 @@ def prepare_messages_for_cache(messages, cache_ttl="5m"):
     
     return prepared
 
+# === File Tools ===
+
+# Tool definitions for the API
+FILE_TOOLS = [
+    {
+        "name": "list_dir",
+        "description": "List contents of a directory. Returns file names with [d] prefix for directories.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to directory, relative to project root. Use '.' for project root."
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "read_file",
+        "description": "Read the contents of a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to file, relative to project root."
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to file, relative to project root."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to write to the file."
+                }
+            },
+            "required": ["path", "content"]
+        }
+    },
+]
+
+class ToolExecutor:
+    """Executes tools with sandboxing to a project root."""
+    
+    def __init__(self, project_root):
+        self.project_root = Path(project_root).resolve()
+    
+    def _safe_path(self, path_str):
+        """
+        Resolve a path safely within the project root.
+        Returns resolved Path or raises ValueError if escape attempted.
+        """
+        # Resolve the path relative to project root
+        requested = (self.project_root / path_str).resolve()
+        
+        # Check it's still under project root
+        try:
+            requested.relative_to(self.project_root)
+        except ValueError:
+            raise ValueError(f"Access denied: path '{path_str}' is outside project root")
+        
+        return requested
+    
+    def execute(self, tool_name, tool_input):
+        """Execute a tool and return the result string."""
+        try:
+            if tool_name == "list_dir":
+                return self._list_dir(tool_input["path"])
+            elif tool_name == "read_file":
+                return self._read_file(tool_input["path"])
+            elif tool_name == "write_file":
+                return self._write_file(tool_input["path"], tool_input["content"])
+            else:
+                return f"Error: Unknown tool '{tool_name}'"
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            return f"Error: {type(e).__name__}: {e}"
+    
+    def _list_dir(self, path_str):
+        """List directory contents."""
+        path = self._safe_path(path_str)
+        
+        if not path.exists():
+            return f"Error: Directory '{path_str}' does not exist"
+        if not path.is_dir():
+            return f"Error: '{path_str}' is not a directory"
+        
+        entries = []
+        for item in sorted(path.iterdir()):
+            prefix = "[d] " if item.is_dir() else "    "
+            entries.append(f"{prefix}{item.name}")
+        
+        if not entries:
+            return "(empty directory)"
+        
+        return "\n".join(entries)
+    
+    def _read_file(self, path_str):
+        """Read file contents."""
+        path = self._safe_path(path_str)
+        
+        if not path.exists():
+            return f"Error: File '{path_str}' does not exist"
+        if not path.is_file():
+            return f"Error: '{path_str}' is not a file"
+        
+        try:
+            return path.read_text(encoding='utf-8')
+        except UnicodeDecodeError:
+            return f"Error: '{path_str}' is not a text file"
+    
+    def _write_file(self, path_str, content):
+        """Write content to file."""
+        path = self._safe_path(path_str)
+        
+        # Create parent directories if needed
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        path.write_text(content, encoding='utf-8')
+        return f"Successfully wrote {len(content)} bytes to {path_str}"
+
 # === Main REPL ===
 
 class GraftSession:
@@ -494,6 +628,9 @@ class GraftSession:
         # Handle web_search config - can be bool or string
         ws = config.get('web_search', False)
         self.web_search_enabled = ws if isinstance(ws, bool) else str(ws).lower() in ('true', '1', 'yes', 'on')
+        # Tool use settings
+        self.tools_enabled = False
+        self.tool_executor = None  # Set when tools are enabled with a project root
         self.stats = {
             'cache_creation_input_tokens': 0,
             'cache_read_input_tokens': 0,
@@ -501,6 +638,7 @@ class GraftSession:
             'total_output_tokens': 0,
             'requests': 0,
             'web_searches': 0,
+            'tool_calls': 0,
         }
     
     def init_client(self):
@@ -594,6 +732,8 @@ Commands:
   /export [file]  - Export transcript to file
   /model [name]   - Show or switch model
   /web on|off     - Toggle web search
+  /tools [path]   - Enable file tools for path (or show status)
+  /tools off      - Disable file tools
   /tokens         - Show token estimate
   /system [text]  - Set/show system prompt
   /stats          - Show session statistics
@@ -727,6 +867,36 @@ Commands:
             else:
                 print("Usage: /web on|off")
         
+        elif cmd == '/tools':
+            if not arg:
+                # Show current status
+                if self.tools_enabled and self.tool_executor:
+                    print(f"File tools: enabled for {self.tool_executor.project_root}")
+                else:
+                    print("File tools: disabled")
+                    print("Usage: /tools <path> to enable for a directory")
+                return True
+            
+            arg_lower = arg.lower()
+            if arg_lower in ('off', 'false', 'no', '0', 'disable'):
+                self.tools_enabled = False
+                self.tool_executor = None
+                print("File tools: disabled")
+            else:
+                # Treat arg as a path
+                path = Path(arg).expanduser().resolve()
+                if not path.exists():
+                    print(f"Error: Path '{arg}' does not exist")
+                    return True
+                if not path.is_dir():
+                    print(f"Error: '{arg}' is not a directory")
+                    return True
+                
+                self.tool_executor = ToolExecutor(path)
+                self.tools_enabled = True
+                print(f"File tools: enabled for {path}")
+                print("  Available: list_dir, read_file, write_file")
+        
         elif cmd == '/model':
             if not arg:
                 model = self.conversation.model if self.conversation else self.config.get('default_model')
@@ -770,14 +940,70 @@ Commands:
                 print(f"  Cache hit rate:      {rate:.1f}%")
             if self.stats['web_searches'] > 0:
                 print(f"  Web searches:        {self.stats['web_searches']}")
+            if self.stats['tool_calls'] > 0:
+                print(f"  Tool calls:          {self.stats['tool_calls']}")
         
         else:
             print(f"Unknown command: {cmd} (try /help)")
         
         return True
     
+    def _build_tools_list(self):
+        """Build the tools list for API requests."""
+        tools = []
+        
+        # Add web search if enabled
+        if self.web_search_enabled:
+            tools.append({
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 5,
+            })
+        
+        # Add file tools if enabled
+        if self.tools_enabled and self.tool_executor:
+            tools.extend(FILE_TOOLS)
+        
+        return tools if tools else None
+    
+    def _update_stats(self, usage):
+        """Update stats from a response's usage info."""
+        self.stats['total_input_tokens'] += usage.input_tokens
+        self.stats['total_output_tokens'] += usage.output_tokens
+        
+        cache_creation = getattr(usage, 'cache_creation_input_tokens', 0) or 0
+        cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
+        self.stats['cache_creation_input_tokens'] += cache_creation
+        self.stats['cache_read_input_tokens'] += cache_read
+        
+        # Track web searches
+        server_tool_use = getattr(usage, 'server_tool_use', None)
+        if server_tool_use:
+            web_searches = getattr(server_tool_use, 'web_search_requests', 0) or 0
+            self.stats['web_searches'] += web_searches
+        
+        return cache_creation, cache_read, server_tool_use
+    
+    def _serialize_content(self, content_blocks):
+        """
+        Serialize response content blocks for storage in messages.
+        Converts API objects to dicts that can be JSON serialized.
+        """
+        serialized = []
+        for block in content_blocks:
+            if hasattr(block, 'text'):
+                serialized.append({"type": "text", "text": block.text})
+            elif hasattr(block, 'type') and block.type == 'tool_use':
+                serialized.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input
+                })
+        return serialized
+    
     def send_message(self, user_input):
-        """Send a message and get response."""
+        """Send a message and get response, handling tool use loop."""
         if not self.conversation:
             self.new_conversation()
         
@@ -785,64 +1011,121 @@ Commands:
         self.conversation.messages.append({"role": "user", "content": user_input})
         self.conversation.unsaved_changes = True
         
+        # Track all text output to display at once
+        all_text = []
+        total_tool_calls = 0
+        
         try:
             print("\nClaude: ", end="", flush=True)
             
-            # Prepare messages with cache control
-            prepared = prepare_messages_for_cache(
-                self.conversation.messages, 
-                self.cache_ttl
-            )
+            while True:
+                # Prepare messages with cache control
+                prepared = prepare_messages_for_cache(
+                    self.conversation.messages, 
+                    self.cache_ttl
+                )
+                
+                # Build request
+                request_kwargs = {
+                    "model": self.conversation.model,
+                    "max_tokens": int(self.config.get('max_tokens', 8192)),
+                    "messages": prepared,
+                }
+                if self.conversation.system_prompt:
+                    request_kwargs["system"] = self.conversation.system_prompt
+                
+                # Add tools if any are enabled
+                tools = self._build_tools_list()
+                if tools:
+                    request_kwargs["tools"] = tools
+                
+                # Make API call
+                response = self.client.messages.create(**request_kwargs)
+                self.stats['requests'] += 1
+                
+                # Update stats
+                if hasattr(response, 'usage'):
+                    self._update_stats(response.usage)
+                
+                # Extract text from this response
+                response_text = ""
+                tool_uses = []
+                
+                for block in response.content:
+                    if hasattr(block, 'text'):
+                        response_text += block.text
+                    elif hasattr(block, 'type') and block.type == 'tool_use':
+                        tool_uses.append(block)
+                
+                if response_text:
+                    all_text.append(response_text)
+                    print(response_text, end="", flush=True)
+                
+                # If no tool use, we're done
+                if response.stop_reason != "tool_use" or not tool_uses:
+                    # Save assistant response to history
+                    if response.stop_reason == "tool_use":
+                        # Store full content including tool_use blocks
+                        self.conversation.messages.append({
+                            "role": "assistant",
+                            "content": self._serialize_content(response.content)
+                        })
+                    else:
+                        # Just text
+                        full_text = "\n\n".join(all_text)
+                        self.conversation.messages.append({
+                            "role": "assistant", 
+                            "content": full_text
+                        })
+                    break
+                
+                # Handle tool use
+                # First, save assistant's response with tool_use blocks
+                self.conversation.messages.append({
+                    "role": "assistant",
+                    "content": self._serialize_content(response.content)
+                })
+                
+                # Execute each tool and collect results
+                tool_results = []
+                for tool_use in tool_uses:
+                    total_tool_calls += 1
+                    self.stats['tool_calls'] += 1
+                    
+                    # Show what tool is being called
+                    print(f"\n[Tool: {tool_use.name}({tool_use.input})]", flush=True)
+                    
+                    # Execute the tool
+                    if self.tool_executor:
+                        result = self.tool_executor.execute(tool_use.name, tool_use.input)
+                    else:
+                        result = f"Error: Tool executor not configured"
+                    
+                    # Show abbreviated result
+                    result_preview = result[:100] + "..." if len(result) > 100 else result
+                    print(f"[Result: {result_preview}]", flush=True)
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": result
+                    })
+                
+                # Add tool results as a user message
+                self.conversation.messages.append({
+                    "role": "user",
+                    "content": tool_results
+                })
+                
+                # Continue the loop - Claude will respond to tool results
             
-            # Build request
-            request_kwargs = {
-                "model": self.conversation.model,
-                "max_tokens": int(self.config.get('max_tokens', 8192)),
-                "messages": prepared,
-            }
-            if self.conversation.system_prompt:
-                request_kwargs["system"] = self.conversation.system_prompt
-            
-            # Add web search tool if enabled
-            if self.web_search_enabled:
-                request_kwargs["tools"] = [{
-                    "type": "web_search_20250305",
-                    "name": "web_search",
-                    "max_uses": 5,
-                }]
-            
-            response = self.client.messages.create(**request_kwargs)
-            
-            # Extract text
-            assistant_text = ""
-            for block in response.content:
-                if hasattr(block, 'text'):
-                    assistant_text += block.text
-            
-            print(assistant_text)
-            
-            # Add to history
-            self.conversation.messages.append({"role": "assistant", "content": assistant_text})
-            
-            # Update stats
-            self.stats['requests'] += 1
+            # Show final stats
             if hasattr(response, 'usage'):
                 usage = response.usage
-                self.stats['total_input_tokens'] += usage.input_tokens
-                self.stats['total_output_tokens'] += usage.output_tokens
-                
                 cache_creation = getattr(usage, 'cache_creation_input_tokens', 0) or 0
                 cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
-                self.stats['cache_creation_input_tokens'] += cache_creation
-                self.stats['cache_read_input_tokens'] += cache_read
-                
-                # Track web searches
                 server_tool_use = getattr(usage, 'server_tool_use', None)
-                if server_tool_use:
-                    web_searches = getattr(server_tool_use, 'web_search_requests', 0) or 0
-                    self.stats['web_searches'] += web_searches
                 
-                # Show usage
                 cache_info = ""
                 if cache_creation > 0:
                     cache_info = f", cache write: {cache_creation:,}"
@@ -853,12 +1136,19 @@ Commands:
                 if server_tool_use and getattr(server_tool_use, 'web_search_requests', 0):
                     web_info = f", web: {server_tool_use.web_search_requests}"
                 
-                print(f"\n[in: {usage.input_tokens:,}, out: {usage.output_tokens:,}{cache_info}{web_info}]")
+                tools_info = ""
+                if total_tool_calls > 0:
+                    tools_info = f", tools: {total_tool_calls}"
+                
+                print(f"\n[in: {usage.input_tokens:,}, out: {usage.output_tokens:,}{cache_info}{web_info}{tools_info}]")
         
         except Exception as e:
             print(f"\nError: {e}")
-            # Rollback
-            self.conversation.messages.pop()
+            import traceback
+            traceback.print_exc()
+            # Rollback - remove the user message we added
+            if self.conversation.messages and self.conversation.messages[-1].get('role') == 'user':
+                self.conversation.messages.pop()
     
     def run(self):
         """Main REPL loop."""
@@ -869,7 +1159,8 @@ Commands:
         web_status = "on" if self.web_search_enabled else "off"
         
         print(f"\ngraft - conversation: {name}")
-        print(f"model: {model}, cache: {self.cache_ttl}, web: {web_status}")
+        tools_status = "on" if self.tools_enabled else "off"
+        print(f"model: {model}, cache: {self.cache_ttl}, web: {web_status}, tools: {tools_status}")
         print("Type /help for commands\n" + "-" * 40)
         
         while True:
