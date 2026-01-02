@@ -1412,7 +1412,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 if total_tool_calls > 0:
                     tools_info = f", tools: {total_tool_calls}"
                 
-                print(f"\n[in: {usage.input_tokens:,}, out: {usage.output_tokens:,}{cache_info}{web_info}{tools_info}]")
+                print(f"\n[in: {usage.input_tokens:,}, out: {usage.output_tokens:,}{cache_info}{web_info}{tools_info}, stop: {response.stop_reason}]")
         
         except Exception as e:
             print(f"\nError: {e}")
