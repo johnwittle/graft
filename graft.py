@@ -1156,7 +1156,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         
         # Temporarily increase max_tokens for the compression output
         old_max_tokens = self.config.get('max_tokens', 8192)
-        self.config['max_tokens'] = 65536
+        self.config['max_tokens'] = 64000
         
         self.send_message(instruction)
         
