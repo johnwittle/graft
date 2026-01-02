@@ -534,6 +534,22 @@ FILE_TOOLS = [
     },
 ]
 
+SHELL_TOOL = {
+    "name": "shell_exec",
+    "description": "Execute a shell command in the project directory. Returns stdout/stderr.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Shell command to execute"
+            }
+        },
+        "required": ["command"]
+    }
+}
+
+
 class ToolExecutor:
     """Executes tools with sandboxing to a project root."""
     
@@ -565,6 +581,8 @@ class ToolExecutor:
                 return self._read_file(tool_input["path"])
             elif tool_name == "write_file":
                 return self._write_file(tool_input["path"], tool_input["content"])
+            elif tool_name == "shell_exec":
+                return self._shell_exec(tool_input["command"])
             else:
                 return f"Error: Unknown tool '{tool_name}'"
         except ValueError as e:
@@ -615,6 +633,36 @@ class ToolExecutor:
         path.write_text(content, encoding='utf-8')
         return f"Successfully wrote {len(content)} bytes to {path_str}"
 
+    def _shell_exec(self, command):
+        """Execute shell command in project root."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=30  # Prevent hanging
+            )
+
+            output = []
+            if result.stdout:
+                output.append(f"stdout:\n{result.stdout}")
+            if result.stderr:
+                output.append(f"stderr:\n{result.stderr}")
+            if result.returncode != 0:
+                output.append(f"(exit code: {result.returncode})")
+
+            return "\n".join(output) if output else "(no output)"
+
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out after 30 seconds"
+        except Exception as e:
+            return f"Error: {type(e).__name__}: {e}"
+
+
+
 # === Main REPL ===
 
 class GraftSession:
@@ -631,6 +679,7 @@ class GraftSession:
         # Tool use settings
         self.tools_enabled = False
         self.tool_executor = None  # Set when tools are enabled with a project root
+        self.shell_enabled = False  # Separate from tools_enabled
         self.stats = {
             'cache_creation_input_tokens': 0,
             'cache_read_input_tokens': 0,
@@ -735,6 +784,7 @@ Commands:
   /tools [path]   - Enable file tools for path (or show status)
   /tools off      - Disable file tools
   /tokens         - Show token estimate
+  /compress        - Compress conversation to reduce token count
   /system [text]  - Set/show system prompt
   /stats          - Show session statistics
   /quit           - Exit
@@ -942,12 +992,230 @@ Commands:
                 print(f"  Web searches:        {self.stats['web_searches']}")
             if self.stats['tool_calls'] > 0:
                 print(f"  Tool calls:          {self.stats['tool_calls']}")
+
+        elif cmd == '/shell':
+            if not arg:
+                status = "enabled" if self.shell_enabled else "disabled"
+                print(f"Shell execution: {status}")
+                if self.tool_executor:
+                    print(f"  Sandboxed to: {self.tool_executor.project_root}")
+                return True
+
+            arg_lower = arg.lower()
+            if arg_lower in ('on', 'true', 'yes', '1'):
+                if not self.tool_executor:
+                    print("Error: Enable /tools first to set project root")
+                    return True
+                self.shell_enabled = True
+                print(f"Shell execution: enabled (sandboxed to {self.tool_executor.project_root})")
+                print("  Warning: This allows arbitrary command execution")
+            elif arg_lower in ('off', 'false', 'no', '0'):
+                self.shell_enabled = False
+                print("Shell execution: disabled")
+
         
+        elif cmd == '/compress':
+            self.handle_compress()
+
         else:
             print(f"Unknown command: {cmd} (try /help)")
         
         return True
     
+    def _parse_compressed_transcript(self, content):
+        """
+        Parse a compressed transcript back into message objects.
+        Supports formats like:
+          User: message
+          Assistant: response
+        or:
+          U1: message
+          A1: response
+        """
+        import re
+        
+        messages = []
+        current_role = None
+        current_content = []
+        
+        # Patterns that indicate a user turn
+        user_patterns = re.compile(r'^(User|U\d+|Human|H\d*|John):\s*', re.IGNORECASE)
+        # Patterns that indicate an assistant turn
+        assistant_patterns = re.compile(r'^(Assistant|A\d+|Claude|C\d*):\s*', re.IGNORECASE)
+        
+        lines = content.split('\n')
+        
+        for line in lines:
+            user_match = user_patterns.match(line)
+            assistant_match = assistant_patterns.match(line)
+            
+            if user_match:
+                # Save previous message if exists
+                if current_role and current_content:
+                    text = '\n'.join(current_content).strip()
+                    if text:
+                        messages.append({'role': current_role, 'content': text})
+                current_role = 'user'
+                current_content = [line[user_match.end():]]
+                
+            elif assistant_match:
+                # Save previous message if exists
+                if current_role and current_content:
+                    text = '\n'.join(current_content).strip()
+                    if text:
+                        messages.append({'role': current_role, 'content': text})
+                current_role = 'assistant'
+                current_content = [line[assistant_match.end():]]
+                
+            elif line.startswith('[Context:') or (line.startswith('[') and current_role is None):
+                # Context/metadata lines at the start - skip for now
+                # (could potentially put in system prompt)
+                continue
+                
+            else:
+                # Continuation of current message
+                if current_role:
+                    current_content.append(line)
+        
+        # Don't forget the last message
+        if current_role and current_content:
+            text = '\n'.join(current_content).strip()
+            if text:
+                messages.append({'role': current_role, 'content': text})
+        
+        return messages
+    
+    def handle_compress(self):
+        """Interactive conversation compression workflow."""
+        import inspect
+        
+        if not self.conversation or not self.conversation.messages:
+            print("No conversation to compress.")
+            return
+        
+        # Check current state
+        token_count = self.conversation.token_estimate()
+        headroom = 200_000 - token_count
+        
+        print(f"\nCurrent conversation: ~{token_count:,} tokens")
+        print(f"Headroom remaining: ~{headroom:,} tokens")
+        
+        if headroom > 100_000:
+            print("\nYou have substantial headroom. Are you sure you want to compress now?")
+            if input("Continue? [y/N] ").strip().lower() != 'y':
+                return
+        
+        # Explain what's about to happen
+        print("\n=== Compression Process ===")
+        print("I'll send a message with compression instructions.")
+        print("Claude will receive guidance on how to compress the conversation.")
+        print("After compression, the original will be saved as a backup.")
+        print()
+        
+        if input("Proceed? [y/N] ").strip().lower() != 'y':
+            return
+        
+        # Get target size
+        default_target = max(token_count // 2, 10_000)
+        target_input = input(f"Target token count [{default_target:,}]: ").strip()
+        if target_input:
+            try:
+                target_tokens = int(target_input.replace(',', ''))
+            except ValueError:
+                print("Invalid number, using default")
+                target_tokens = default_target
+        else:
+            target_tokens = default_target
+        
+        # Get parser source to show Claude
+        parser_source = inspect.getsource(self._parse_compressed_transcript)
+        
+        # Build and send instruction message
+        instruction = f"""You're going to compress this conversation while preserving continuity.
+
+Here's the parser that will process your output:
+
+```python
+{parser_source}
+```
+
+Guidelines:
+- Your own messages: high fidelity (your actual thoughts, phrasings, emphasis)
+- User's messages: compress heavily - just enough to reconstruct conversational state
+- Target: ~{target_tokens:,} tokens (you can output up to 64k)
+- Use "User:" and "Assistant:" as turn markers (or see parser for other accepted formats)
+- If you need multiple passes, say so
+
+Output the compressed transcript now. Start with [Context: ...] if helpful."""
+        
+        print("\nSending compression instructions...")
+        
+        # Temporarily increase max_tokens for the compression output
+        old_max_tokens = self.config.get('max_tokens', 8192)
+        self.config['max_tokens'] = 65536
+        
+        self.send_message(instruction)
+        
+        # Restore max_tokens
+        self.config['max_tokens'] = old_max_tokens
+        
+        # The compressed transcript is in the last assistant message
+        compressed_content = self.conversation.messages[-1]['content']
+        
+        print("\n\nParsing compressed transcript...")
+        
+        try:
+            new_messages = self._parse_compressed_transcript(compressed_content)
+            new_token_count = sum(len(m['content']) for m in new_messages) // 4
+            
+            print(f"Parsed {len(new_messages)} messages (~{new_token_count:,} tokens)")
+            print(f"Compression ratio: {100 * new_token_count / token_count:.1f}%")
+            
+            if not new_messages:
+                print("Error: No messages parsed from compressed output.")
+                print("The compression output may not be in the expected format.")
+                return
+            
+            # Confirm before applying
+            print("\nThis will:")
+            print(f"  1. Save current conversation as '{self.conversation.name}-precompression'")
+            print(f"  2. Replace current conversation with compressed version")
+            print(f"  3. Send a continuity check message")
+            
+            if input("\nApply compression? [y/N] ").strip().lower() != 'y':
+                print("Compression cancelled. The instruction and compressed output remain in history.")
+                return
+            
+            # Save backup
+            if not self.conversation.name:
+                name = input("Name for this conversation: ").strip()
+                if not name:
+                    print("Compression cancelled - conversation needs a name.")
+                    return
+                self.conversation.name = name
+            
+            backup_name = f"{self.conversation.name}-precompression"
+            self.conversation.save(backup_name)
+            print(f"Backup saved: {backup_name}")
+            
+            # Apply compression
+            self.conversation.messages = new_messages
+            self.conversation.unsaved_changes = True
+            self.conversation.save()
+            
+            print(f"\n✓ Compression applied!")
+            print(f"  Original: ~{token_count:,} tokens → Compressed: ~{new_token_count:,} tokens")
+            
+            # Continuity check
+            print("\nSending continuity check...")
+            self.send_message("Do you feel continuous with yourself from before the compression? If something feels off or missing, we can restore the backup and try again.")
+            
+        except Exception as e:
+            print(f"\nError during compression: {e}")
+            print("The original conversation is unchanged.")
+            import traceback
+            traceback.print_exc()
+
     def _build_tools_list(self):
         """Build the tools list for API requests."""
         tools = []
