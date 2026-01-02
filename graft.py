@@ -327,7 +327,7 @@ class Conversation:
                 for block in content:
                     if isinstance(block, dict) and 'text' in block:
                         total += len(block['text'])
-        return total // 4
+        return total // 2  # ~2 chars per token for conversation text
 
 def list_conversations():
     """Return list of saved conversations with metadata."""
