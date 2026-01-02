@@ -1276,7 +1276,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         return serialized
     
     def send_message(self, user_input):
-        """Send a message and get response, handling tool use loop."""
+        """Send a message and get response with streaming."""
         if not self.conversation:
             self.new_conversation()
         
@@ -1284,8 +1284,6 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         self.conversation.messages.append({"role": "user", "content": user_input})
         self.conversation.unsaved_changes = True
         
-        # Track all text output to display at once
-        all_text = []
         total_tool_calls = 0
         
         try:
@@ -1312,27 +1310,29 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 if tools:
                     request_kwargs["tools"] = tools
                 
-                # Make API call
-                response = self.client.messages.create(**request_kwargs)
+                # Make streaming API call
+                with self.client.messages.stream(**request_kwargs) as stream:
+                    response_text = ""
+                    
+                    # Stream text as it arrives
+                    for text in stream.text_stream:
+                        print(text, end="", flush=True)
+                        response_text += text
+                    
+                    # Get the final message for metadata
+                    response = stream.get_final_message()
+                
                 self.stats['requests'] += 1
                 
                 # Update stats
                 if hasattr(response, 'usage'):
                     self._update_stats(response.usage)
                 
-                # Extract text from this response
-                response_text = ""
+                # Check for tool use
                 tool_uses = []
-                
                 for block in response.content:
-                    if hasattr(block, 'text'):
-                        response_text += block.text
-                    elif hasattr(block, 'type') and block.type == 'tool_use':
+                    if hasattr(block, 'type') and block.type == 'tool_use':
                         tool_uses.append(block)
-                
-                if response_text:
-                    all_text.append(response_text)
-                    print(response_text, end="", flush=True)
                 
                 # If no tool use, we're done
                 if response.stop_reason != "tool_use" or not tool_uses:
@@ -1345,10 +1345,9 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                         })
                     else:
                         # Just text
-                        full_text = "\n\n".join(all_text)
                         self.conversation.messages.append({
                             "role": "assistant", 
-                            "content": full_text
+                            "content": response_text
                         })
                     break
                 
@@ -1422,7 +1421,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
             # Rollback - remove the user message we added
             if self.conversation.messages and self.conversation.messages[-1].get('role') == 'user':
                 self.conversation.messages.pop()
-    
+
     def run(self):
         """Main REPL loop."""
         self.init_client()
