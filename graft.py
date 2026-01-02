@@ -698,7 +698,7 @@ class GraftSession:
             print("Error: ANTHROPIC_API_KEY not found")
             print("Set it in one of: ./.env, ~/.env, ~/.graft/.env")
             sys.exit(1)
-        self.client = Anthropic(api_key=api_key)
+        self.client = Anthropic(api_key=api_key, timeout=600.0)  # 10 min timeout for long outputs
     
     def new_conversation(self):
         """Start a fresh conversation."""
