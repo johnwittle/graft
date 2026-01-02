@@ -688,6 +688,7 @@ class GraftSession:
             'requests': 0,
             'web_searches': 0,
             'tool_calls': 0,
+            'last_input_tokens': 0,  # Most recent API-reported context size
         }
     
     def init_client(self):
@@ -1093,13 +1094,16 @@ Commands:
             print("No conversation to compress.")
             return
         
-        # Check current state
-        token_count = self.conversation.token_estimate()
+        # Check current state - use API-reported count if available, else estimate
+        if self.stats['last_input_tokens'] > 0:
+            token_count = self.stats['last_input_tokens']
+            print(f"\nCurrent conversation: {token_count:,} tokens (from API)")
+        else:
+            token_count = self.conversation.token_estimate()
+            print(f"\nCurrent conversation: ~{token_count:,} tokens (estimated)")
+        
         headroom = 200_000 - token_count
-        
-        print(f"\nCurrent conversation: ~{token_count:,} tokens")
         print(f"Headroom remaining: ~{headroom:,} tokens")
-        
         if headroom > 100_000:
             print("\nYou have substantial headroom. Are you sure you want to compress now?")
             if input("Continue? [y/N] ").strip().lower() != 'y':
@@ -1237,6 +1241,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
     def _update_stats(self, usage):
         """Update stats from a response's usage info."""
         self.stats['total_input_tokens'] += usage.input_tokens
+        self.stats['last_input_tokens'] = usage.input_tokens  # Current context size
         self.stats['total_output_tokens'] += usage.output_tokens
         
         cache_creation = getattr(usage, 'cache_creation_input_tokens', 0) or 0
