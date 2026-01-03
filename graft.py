@@ -1236,6 +1236,10 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         if self.tools_enabled and self.tool_executor:
             tools.extend(FILE_TOOLS)
         
+        # Add shell tool if enabled
+        if self.shell_enabled and self.tool_executor:
+            tools.append(SHELL_TOOL)
+        
         return tools if tools else None
     
     def _update_stats(self, usage):
