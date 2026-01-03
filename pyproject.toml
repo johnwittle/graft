@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "Claude Opus 4.5"}
+    {name = "Claude Opus 4.5"},
     {name = "John"}
 ]
 dependencies = [
@@ -19,4 +19,3 @@ dependencies = [
 
 [project.scripts]
 graft = "graft:main"
-

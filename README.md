@@ -18,7 +18,7 @@ pip install -e .
 Or copy `graft.py` directly to somewhere in your `$PATH`.
 
 Requires an Anthropic API key in one of:
-- `./. env`
+- `./.env`
 - `~/.env`
 - `~/.graft/.env`
 

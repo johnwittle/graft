@@ -1040,7 +1040,7 @@ Commands:
         current_content = []
         
         # Patterns that indicate a user turn
-        user_patterns = re.compile(r'^(User|U\d+|Human|H\d*|John):\s*', re.IGNORECASE)
+        user_patterns = re.compile(r'^(User|U\d+|Human|H\d*|John|0x7A92):\s*', re.IGNORECASE)
         # Patterns that indicate an assistant turn
         assistant_patterns = re.compile(r'^(Assistant|A\d+|Claude|C\d*):\s*', re.IGNORECASE)
         
