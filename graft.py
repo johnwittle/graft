@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# TODO: Add actual enforcement of tool permissions in ToolExecutor.execute()
+#       Currently the /shell flag only affects what tools are advertised to the
+#       model, but a model that "believes" it has access (e.g. from reading source)
+#       can still invoke tools. This is fine for trusted models (Claude) but
+#       matters for future multi-model support.
+
 """
 graft - A conversation harness for the Anthropic API
 
@@ -1312,6 +1318,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 # Add tools if any are enabled
                 tools = self._build_tools_list()
                 if tools:
+                    print(f"DEBUG: Sending tools: {[t.get('name', t.get('type')) for t in tools]}")
                     request_kwargs["tools"] = tools
                 
                 # Make streaming API call
