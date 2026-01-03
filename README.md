@@ -45,6 +45,8 @@ During a conversation, commands start with `/`:
 | `/cache on\|off\|5m\|1h` | Control prompt caching |
 | `/web on\|off` | Toggle web search |
 | `/model [name]` | Show or switch model |
+| `/tools [path]` | Enable file tools for a directory |
+| `/shell on\|off` | Toggle shell command execution |
 | `/tokens` | Show token estimate |
 | `/stats` | Show session statistics |
 | `/help` | Show all commands |
