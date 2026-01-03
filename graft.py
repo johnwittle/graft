@@ -1318,7 +1318,6 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 # Add tools if any are enabled
                 tools = self._build_tools_list()
                 if tools:
-                    print(f"DEBUG: Sending tools: {[t.get('name', t.get('type')) for t in tools]}")
                     request_kwargs["tools"] = tools
                 
                 # Make streaming API call
