@@ -542,7 +542,7 @@ FILE_TOOLS = [
 
 SHELL_TOOL = {
     "name": "shell_exec",
-    "description": "Execute a shell command in the project directory. Returns stdout/stderr. TIMEOUT: Commands are killed after 30 seconds. For long-running operations, use backgrounding (command &), nohup, or redirect output to a file.",
+    "description": "Execute a shell command in the project directory. Returns stdout/stderr. TIMEOUT: Commands are killed after 30 seconds. For long-running operations, use screen -dmS name command, or redirect output to a file. Note: backgrounding (&) and nohup do not reliably preserve pipelines.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -663,7 +663,7 @@ class ToolExecutor:
             return "\n".join(output) if output else "(no output)"
 
         except subprocess.TimeoutExpired:
-            return "Error: Command timed out and was killed after 30 seconds. For long-running commands, use backgrounding (command &) or redirect output to a file."
+            return "Error: Command timed out and was killed after 30 seconds. For long-running commands, use screen -dmS name command, or redirect output to a file."
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
 
