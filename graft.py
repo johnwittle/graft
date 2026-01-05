@@ -696,6 +696,7 @@ class GraftSession:
             'tool_calls': 0,
             'last_input_tokens': 0,  # Most recent API-reported context size
         }
+        self.recent_tool_calls = []  # Timestamps for rate limiting warnings
     
     def init_client(self):
         """Initialize Anthropic client."""
@@ -1248,6 +1249,18 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         
         return tools if tools else None
     
+    def _check_tool_rate(self):
+        """Check tool call rate and return a warning message if excessive."""
+        import time
+        now = time.time()
+        # Clean out calls older than 60 seconds
+        self.recent_tool_calls = [t for t in self.recent_tool_calls if now - t < 60]
+        self.recent_tool_calls.append(now)
+        
+        if len(self.recent_tool_calls) >= 10:
+            return f"\n\n[Note: {len(self.recent_tool_calls)} tool calls in the last 60 seconds. Consider adding sleep between checks of long-running processes to reduce API costs.]"
+        return ""
+
     def _update_stats(self, usage):
         """Update stats from a response's usage info."""
         self.stats['total_input_tokens'] += usage.input_tokens
@@ -1383,6 +1396,9 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                     else:
                         result = f"Error: Tool executor not configured"
                     
+                    
+                    # Check for excessive tool call rate
+                    result += self._check_tool_rate()
                     # Show abbreviated result
                     result_preview = result[:100] + "..." if len(result) > 100 else result
                     print(f"[Result: {result_preview}]", flush=True)
