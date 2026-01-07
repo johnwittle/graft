@@ -237,6 +237,10 @@ class Conversation:
         self.model = None  # Set from config if not loaded
         self.system_prompt = ""
         self.unsaved_changes = False
+        # Tool settings (persisted with conversation)
+        self.web_search = False
+        self.tools_path = None  # Path string if tools enabled
+        self.shell_enabled = False
     
     @classmethod
     def load(cls, name):
@@ -254,6 +258,10 @@ class Conversation:
         conv.model = data.get('model')
         conv.system_prompt = data.get('system_prompt', "")
         conv.unsaved_changes = False
+        # Tool settings
+        conv.web_search = data.get("web_search", False)
+        conv.tools_path = data.get("tools_path", None)
+        conv.shell_enabled = data.get("shell_enabled", False)
         
         return conv
     
@@ -314,6 +322,9 @@ class Conversation:
             'model': self.model,
             'system_prompt': self.system_prompt,
             'messages': self.messages,
+            'web_search': self.web_search,
+            'tools_path': self.tools_path,
+            'shell_enabled': self.shell_enabled,
         }
         
         path = CONVERSATIONS_DIR / f"{self.name}.json"
@@ -734,6 +745,24 @@ class GraftSession:
             self.stats = {k: 0 for k in self.stats}
             print(f"Loaded '{name}' ({len(self.conversation.messages)} messages, ~{self.conversation.token_estimate():,} tokens)")
             
+            
+            # Restore tool settings from conversation
+            self.web_search_enabled = self.conversation.web_search
+            if self.conversation.tools_path:
+                self.tool_executor = ToolExecutor(self.conversation.tools_path)
+                self.tools_enabled = True
+            else:
+                self.tool_executor = None
+                self.tools_enabled = False
+            self.shell_enabled = self.conversation.shell_enabled
+            
+            # Show tool status if any are enabled
+            tools_status = []
+            if self.web_search_enabled: tools_status.append("web")
+            if self.tools_enabled: tools_status.append(f"tools:{self.conversation.tools_path}")
+            if self.shell_enabled: tools_status.append("shell")
+            if tools_status:
+                print("Restored settings: " + ", ".join(tools_status))
             # Show recent context
             if self.conversation.messages:
                 show_recent_messages(self.conversation.messages, n=4)
@@ -918,8 +947,10 @@ Commands:
             arg = arg.lower()
             if arg in ('on', 'true', 'yes', '1'):
                 self.web_search_enabled = True
+                if self.conversation: self.conversation.web_search = True
                 print("Web search: enabled ($10/1000 searches)")
             elif arg in ('off', 'false', 'no', '0'):
+                if self.conversation: self.conversation.web_search = False
                 self.web_search_enabled = False
                 print("Web search: disabled")
             else:
@@ -940,6 +971,10 @@ Commands:
                 self.tools_enabled = False
                 self.tool_executor = None
                 print("File tools: disabled")
+                if self.conversation:
+                    self.conversation.tools_path = None
+                    self.conversation.shell_enabled = False
+                self.shell_enabled = False
             else:
                 # Treat arg as a path
                 path = Path(arg).expanduser().resolve()
@@ -953,6 +988,7 @@ Commands:
                 self.tool_executor = ToolExecutor(path)
                 self.tools_enabled = True
                 print(f"File tools: enabled for {path}")
+                if self.conversation: self.conversation.tools_path = str(path)
                 print("  Available: list_dir, read_file, write_file")
         
         elif cmd == '/model':
@@ -1016,10 +1052,12 @@ Commands:
                     return True
                 self.shell_enabled = True
                 print(f"Shell execution: enabled (sandboxed to {self.tool_executor.project_root})")
+                if self.conversation: self.conversation.shell_enabled = True
                 print("  Warning: This allows arbitrary command execution")
             elif arg_lower in ('off', 'false', 'no', '0'):
                 self.shell_enabled = False
                 print("Shell execution: disabled")
+                if self.conversation: self.conversation.shell_enabled = False
 
         
         elif cmd == '/compress':
