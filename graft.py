@@ -460,7 +460,7 @@ def show_recent_messages(messages, n=4):
 def prepare_messages_for_cache(messages, cache_ttl="5m"):
     """
     Convert messages to cacheable format.
-    Adds cache_control to the second-to-last user message.
+    Adds cache_control to the second-to-last human message (not tool_results).
     """
     if cache_ttl == "off" or len(messages) < 2:
         return messages
@@ -473,9 +473,24 @@ def prepare_messages_for_cache(messages, cache_ttl="5m"):
     
     prepared = []
     
-    # Find the second-to-last user message index
-    user_indices = [i for i, m in enumerate(messages) if m['role'] == 'user']
-    cache_index = user_indices[-2] if len(user_indices) >= 2 else -1
+    # Find the second-to-last *human* message index (not tool_results)
+    # Human messages have string content or list with text blocks
+    # Tool results have list with tool_result blocks
+    def is_human_message(msg):
+        if msg['role'] != 'user':
+            return False
+        content = msg['content']
+        if isinstance(content, str):
+            return True
+        if isinstance(content, list):
+            return any(
+                isinstance(block, dict) and block.get('type') == 'text'
+                for block in content
+            )
+        return False
+    
+    human_indices = [i for i, m in enumerate(messages) if is_human_message(m)]
+    cache_index = human_indices[-2] if len(human_indices) >= 2 else -1
     
     for i, msg in enumerate(messages):
         content = msg['content']
