@@ -25,8 +25,8 @@ Commands during conversation:
   /new            - Start fresh conversation
   /rename <name>  - Rename current conversation
   /delete <n>  - Delete a saved conversation
-  /read           - View full transcript in pager
-  /export [file]  - Export transcript to file
+  /read [--tools]  - View full transcript in pager
+  /export [--tools] [file] - Export transcript to file
   /cache on|off|5m|1h  - Control prompt caching
   /model [name]   - Show or switch model
   /web on|off     - Toggle web search
@@ -389,7 +389,7 @@ def format_conversation_list(convos):
 
 # === Transcript Formatting ===
 
-def format_message(msg, width=80):
+def format_message(msg, width=80, include_tools=False):
     """Format a single message for display."""
     role = msg.get('role', 'unknown')
     content = msg.get('content', '')
@@ -398,8 +398,22 @@ def format_message(msg, width=80):
     if isinstance(content, list):
         text_parts = []
         for block in content:
-            if isinstance(block, dict) and 'text' in block:
-                text_parts.append(block['text'])
+            if isinstance(block, dict):
+                if 'text' in block:
+                    text_parts.append(block['text'])
+                elif include_tools and block.get('type') == 'tool_use':
+                    tool_name = block.get('name', 'unknown')
+                    tool_input = block.get('input', {})
+                    # Format tool input compactly
+                    import json
+                    input_str = json.dumps(tool_input) if len(json.dumps(tool_input)) < 100 else json.dumps(tool_input)[:100] + '...'
+                    text_parts.append(f"[Tool: {tool_name}({input_str})]")
+                elif include_tools and block.get('type') == 'tool_result':
+                    tool_content = block.get('content', '')
+                    # Truncate long results
+                    if len(tool_content) > 200:
+                        tool_content = tool_content[:200] + '...'
+                    text_parts.append(f"[Result: {tool_content}]")
         content = '\n\n'.join(text_parts)
     
     # Format role header
@@ -412,14 +426,14 @@ def format_message(msg, width=80):
     
     return f"{header}\n{content}"
 
-def format_transcript(messages, last_n=None):
+def format_transcript(messages, last_n=None, include_tools=False):
     """Format messages as human-readable transcript."""
     if last_n:
         messages = messages[-last_n:]
     
     parts = []
     for msg in messages:
-        parts.append(format_message(msg))
+        parts.append(format_message(msg, include_tools=include_tools))
     
     separator = "\n\n" + ("-" * 40) + "\n\n"
     return separator.join(parts)
@@ -829,8 +843,8 @@ Commands:
   /rename <name>  - Rename current conversation
   /cache on|off|5m|1h  - Control prompt caching
   /delete <name>  - Delete a saved conversation
-  /read           - View full transcript in pager
-  /export [file]  - Export transcript to file
+  /read [--tools]  - View full transcript in pager
+  /export [--tools] [file] - Export transcript to file
   /model [name]   - Show or switch model
   /web on|off     - Toggle web search
   /tools [path]   - Enable file tools for path (or show status)
@@ -915,7 +929,8 @@ Commands:
                 print("No conversation to read.")
                 return True
             
-            transcript = format_transcript(self.conversation.messages)
+            include_tools = arg and arg.lower() in ('tools', '--tools', '-t')
+            transcript = format_transcript(self.conversation.messages, include_tools=include_tools)
             show_in_pager(transcript)
         
         elif cmd == '/export':
@@ -923,17 +938,29 @@ Commands:
                 print("No conversation to export.")
                 return True
             
-            # Default filename based on conversation name
+            # Parse arguments: /export [--tools] [filename]
+            include_tools = False
+            filename = None
             if arg:
-                filename = arg
-            elif self.conversation.name:
-                filename = f"{self.conversation.name}.txt"
-            else:
-                filename = "conversation.txt"
+                parts = arg.split()
+                for part in parts:
+                    if part.lower() in ('tools', '--tools', '-t'):
+                        include_tools = True
+                    else:
+                        filename = part
             
-            transcript = format_transcript(self.conversation.messages)
+            # Default filename based on conversation name
+            if not filename:
+                if self.conversation.name:
+                    filename = f"{self.conversation.name}.txt"
+                else:
+                    filename = "conversation.txt"
+            
+            # Ensure parent directory exists
+            Path(filename).parent.mkdir(parents=True, exist_ok=True)
+            transcript = format_transcript(self.conversation.messages, include_tools=include_tools)
             Path(filename).write_text(transcript, encoding='utf-8')
-            print(f"Exported to {filename}")
+            print(f"Exported to {filename}" + (" (with tools)" if include_tools else ""))
         
         elif cmd == '/cache':
             if not arg:
@@ -1361,6 +1388,10 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         self.conversation.unsaved_changes = True
         
         total_tool_calls = 0
+        turn_input_tokens = 0
+        turn_output_tokens = 0
+        turn_cache_creation = 0
+        turn_cache_read = 0
         
         try:
             print("\nClaude: ", end="", flush=True)
@@ -1403,6 +1434,11 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 # Update stats
                 if hasattr(response, 'usage'):
                     self._update_stats(response.usage)
+                    # Track per-turn totals for display
+                    turn_input_tokens += response.usage.input_tokens
+                    turn_output_tokens += response.usage.output_tokens
+                    turn_cache_creation += getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
+                    turn_cache_read += getattr(response.usage, 'cache_read_input_tokens', 0) or 0
                 
                 # Check for tool use
                 tool_uses = []
@@ -1470,28 +1506,25 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 
                 # Continue the loop - Claude will respond to tool results
             
-            # Show final stats
-            if hasattr(response, 'usage'):
-                usage = response.usage
-                cache_creation = getattr(usage, 'cache_creation_input_tokens', 0) or 0
-                cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
-                server_tool_use = getattr(usage, 'server_tool_use', None)
-                
+            # Show final stats (cumulative for entire turn including tool calls)
+            if turn_input_tokens > 0:
                 cache_info = ""
-                if cache_creation > 0:
-                    cache_info = f", cache write: {cache_creation:,}"
-                elif cache_read > 0:
-                    cache_info = f", cache read: {cache_read:,}"
+                if turn_cache_creation > 0:
+                    cache_info = f", cache write: {turn_cache_creation:,}"
+                elif turn_cache_read > 0:
+                    cache_info = f", cache read: {turn_cache_read:,}"
                 
                 web_info = ""
-                if server_tool_use and getattr(server_tool_use, 'web_search_requests', 0):
-                    web_info = f", web: {server_tool_use.web_search_requests}"
+                if hasattr(response, 'usage'):
+                    server_tool_use = getattr(response.usage, 'server_tool_use', None)
+                    if server_tool_use and getattr(server_tool_use, 'web_search_requests', 0):
+                        web_info = f", web: {server_tool_use.web_search_requests}"
                 
                 tools_info = ""
                 if total_tool_calls > 0:
                     tools_info = f", tools: {total_tool_calls}"
                 
-                print(f"\n[in: {usage.input_tokens:,}, out: {usage.output_tokens:,}{cache_info}{web_info}{tools_info}, stop: {response.stop_reason}]")
+                print(f"\n[in: {turn_input_tokens:,}, out: {turn_output_tokens:,}{cache_info}{web_info}{tools_info}, stop: {response.stop_reason}]")
         
         except Exception as e:
             print(f"\nError: {e}")
