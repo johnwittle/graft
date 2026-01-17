@@ -29,6 +29,7 @@ Commands during conversation:
   /export [--tools] [file] - Export transcript to file
   /cache on|off|5m|1h  - Control prompt caching
   /model [name]   - Show or switch model
+  /max_tokens [n] - Show or set max output tokens
   /web on|off     - Toggle web search
   /tools [path]   - Enable file tools for a directory
   /tokens         - Show token estimates
@@ -849,6 +850,7 @@ Commands:
   /read [--tools]  - View full transcript in pager
   /export [--tools] [file] - Export transcript to file
   /model [name]   - Show or switch model
+  /max_tokens [n] - Show or set max output tokens
   /web on|off     - Toggle web search
   /tools [path]   - Enable file tools for path (or show status)
   /tools off      - Disable file tools
@@ -1046,6 +1048,22 @@ Commands:
                 self.conversation.model = arg
                 self.conversation.unsaved_changes = True
             print(f"Model set to: {arg}")
+        
+        elif cmd == '/max_tokens' or cmd == '/output':
+            current = self.config.get('max_tokens', 8192)
+            if not arg:
+                print(f"Current max output tokens: {current:,}")
+                print("Usage: /max_tokens <number>  (e.g., /max_tokens 4096)")
+                return True
+            try:
+                new_val = int(arg)
+                if new_val < 1 or new_val > 128000:
+                    print("Max tokens must be between 1 and 128000")
+                    return True
+                self.config['max_tokens'] = new_val
+                print(f"Max output tokens set to: {new_val:,}")
+            except ValueError:
+                print(f"Invalid number: {arg}")
         
         elif cmd == '/tokens':
             if not self.conversation:
