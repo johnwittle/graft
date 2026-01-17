@@ -77,3 +77,55 @@ By default, thinking blocks and tool use are preserved. Use `--no-thinking` or `
 ## License
 
 MIT
+
+## Claude Code Integration
+
+The `bin/` directory contains utilities for integrating with Claude Code while preserving session history:
+
+### claude-sub
+
+A wrapper for Claude Code that automatically archives sessions:
+
+```bash
+claude-sub "fix the login bug" --dangerously-skip-permissions
+```
+
+Sessions are archived to `~/.claude-archive/` with timestamps and task descriptions.
+
+### claude-session-to-graft
+
+Convert archived Claude Code sessions to graft format:
+
+```bash
+claude-session-to-graft ~/.claude-archive/raw/session.jsonl output.json
+# Then load in graft:
+cp output.json ~/.graft/conversations/
+graft output
+```
+
+### claude-archive-list
+
+List archived Claude Code sessions:
+
+```bash
+claude-archive-list          # Summary view
+claude-archive-list --full   # Full session log
+```
+
+### Setup
+
+Add the bin directory to your PATH, or symlink the tools:
+
+```bash
+# Option 1: Add to PATH in ~/.bashrc
+export PATH="$PATH:/path/to/graft/bin"
+
+# Option 2: Symlink to existing bin directory
+ln -s /path/to/graft/bin/claude-* ~/bin/
+```
+
+Create the archive directory:
+
+```bash
+mkdir -p ~/.claude-archive/raw
+```

@@ -1,0 +1,22 @@
+#!/bin/bash
+# List archived Claude Code sessions
+# Usage: claude-archive-list [--full]
+
+ARCHIVE_DIR="$HOME/.claude-archive"
+SESSIONS_LOG="$ARCHIVE_DIR/sessions.log"
+
+if [ "$1" == "--full" ]; then
+    cat "$SESSIONS_LOG"
+else
+    # Show summary: session ID, task, exit code
+    grep -E "^\[" "$SESSIONS_LOG" | awk '
+        /START/ { session=$1; gsub(/[\[\]]/, "", session) }
+        /TASK:/ { task=substr($0, index($0, "TASK: ")+6) }
+        /END.*exit=/ { 
+            match($0, /exit=[0-9]+/)
+            exit_code=substr($0, RSTART+5, RLENGTH-5)
+            printf "%-30s exit=%-3s %s\n", session, exit_code, task
+            task=""
+        }
+    '
+fi
