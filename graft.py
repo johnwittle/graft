@@ -1511,8 +1511,9 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
             
             # Show final stats
             if hasattr(response, 'usage'):
-                # Context size is from the final API call (current conversation size)
-                context_size = response.usage.input_tokens
+                # Context size = input_tokens + cache_read (cache_read is part of context but billed differently)
+                cache_read = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
+                context_size = response.usage.input_tokens + cache_read
                 
                 cache_info = ""
                 if turn_cache_creation > 0:
