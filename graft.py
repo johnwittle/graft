@@ -139,15 +139,17 @@ def setup_readline(config):
     atexit.register(lambda: readline.write_history_file(HISTORY_PATH))
 
 def load_dotenv():
-    """Load .env file for API key."""
+    """Load .env file and return dict of values (without polluting os.environ)."""
+    env_vars = {}
     for env_path in [Path('.env'), Path.home() / '.env', GRAFT_DIR / '.env']:
         if env_path.exists():
             for line in env_path.read_text().splitlines():
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
-                    os.environ[key.strip()] = value.strip().strip('"\'')
-            return
+                    env_vars[key.strip()] = value.strip().strip('"\'')
+            break
+    return env_vars
 
 # === Conversation Management ===
 
@@ -714,8 +716,9 @@ class ToolExecutor:
 class GraftSession:
     """Main session manager."""
     
-    def __init__(self, config):
+    def __init__(self, config, env_vars=None):
         self.config = config
+        self.env_vars = env_vars or {}
         self.conversation = None
         self.client = None
         self.cache_ttl = config.get('cache_ttl', '5m')
@@ -740,7 +743,7 @@ class GraftSession:
     
     def init_client(self):
         """Initialize Anthropic client."""
-        api_key = os.environ.get('ANTHROPIC_API_KEY')
+        api_key = self.env_vars.get('ANTHROPIC_API_KEY')
         if not api_key:
             print("Error: ANTHROPIC_API_KEY not found")
             print("Set it in one of: ./.env, ~/.env, ~/.graft/.env")
@@ -1573,12 +1576,12 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
 def main():
     ensure_graft_dirs()
     save_default_config()
-    load_dotenv()
+    env_vars = load_dotenv()
     
     config = load_config()
     setup_readline(config)
     
-    session = GraftSession(config)
+    session = GraftSession(config, env_vars)
     
     # Parse command line
     args = sys.argv[1:]
