@@ -93,6 +93,8 @@ if [ -d "$CLAUDE_PROJECT_DIR" ]; then
 fi
 
 # Run Claude Code non-interactively
+# Unset API key to force Claude Code to use OAuth (Max plan) instead
+unset ANTHROPIC_API_KEY
 # --print: non-interactive mode, print response and exit
 # --dangerously-skip-permissions: skip all permission dialogs (safe in supervised context)
 # --output-format json: structured output for easier parsing
