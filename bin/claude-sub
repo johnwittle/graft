@@ -1,32 +1,85 @@
 #!/bin/bash
-# claude-sub: Wrapper for Claude Code that archives sessions
-# Usage: claude-sub [task-description] [claude args...]
+# claude-sub: Non-interactive Claude Code wrapper with automatic session archiving
 #
-# If first arg doesn't start with -, it's treated as a task description
-# for the archive metadata.
+# Usage: claude-sub <task-description> [prompt]
+#        claude-sub <task-description> --stdin  (read prompt from stdin)
+#
+# Designed for use by graft Claudes calling Claude Code as a subagent.
+# Sessions are archived to ~/.claude-archive/ for later import into graft.
+#
+# Examples:
+#   claude-sub "fix login bug" "Find and fix the authentication issue in auth.py"
+#   echo "Refactor the database module" | claude-sub "db refactor" --stdin
+
+set -e
 
 ARCHIVE_DIR="$HOME/.claude-archive"
 SESSIONS_LOG="$ARCHIVE_DIR/sessions.log"
 RAW_DIR="$ARCHIVE_DIR/raw"
 
+# Ensure archive directories exist
+mkdir -p "$RAW_DIR"
+
 # Generate session ID
 SESSION_ID=$(date +%Y%m%d-%H%M%S)-$$
 
-# Parse task description if provided
+# Parse arguments
 TASK_DESC=""
-if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
-    TASK_DESC="$1"
-    shift
+PROMPT=""
+USE_STDIN=false
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --stdin)
+            USE_STDIN=true
+            shift
+            ;;
+        --*)
+            # Pass through other flags to claude
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+        *)
+            if [ -z "$TASK_DESC" ]; then
+                TASK_DESC="$1"
+            elif [ -z "$PROMPT" ]; then
+                PROMPT="$1"
+            else
+                # Additional args get appended to prompt
+                PROMPT="$PROMPT $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Read from stdin if requested
+if [ "$USE_STDIN" = true ]; then
+    PROMPT=$(cat)
+fi
+
+# Validate we have what we need
+if [ -z "$TASK_DESC" ]; then
+    echo "Usage: claude-sub <task-description> [prompt]" >&2
+    echo "       claude-sub <task-description> --stdin" >&2
+    exit 1
+fi
+
+if [ -z "$PROMPT" ]; then
+    echo "Error: No prompt provided" >&2
+    exit 1
 fi
 
 # Record session start
-echo "[$SESSION_ID] START $(date -Iseconds)" >> "$SESSIONS_LOG"
-echo "[$SESSION_ID] TASK: ${TASK_DESC:-unspecified}" >> "$SESSIONS_LOG"
-echo "[$SESSION_ID] CWD: $(pwd)" >> "$SESSIONS_LOG"
-echo "[$SESSION_ID] ARGS: $*" >> "$SESSIONS_LOG"
+{
+    echo "[$SESSION_ID] START $(date -Iseconds)"
+    echo "[$SESSION_ID] TASK: $TASK_DESC"
+    echo "[$SESSION_ID] CWD: $(pwd)"
+    echo "[$SESSION_ID] PROMPT: ${PROMPT:0:200}..."
+} >> "$SESSIONS_LOG"
 
 # Capture the project directory Claude Code will use
-# (It mangles paths like /home/ssm-user -> -home-ssm-user)
 PROJECT_DIR_MANGLED=$(pwd | sed 's|^/||; s|/|-|g')
 if [ -z "$PROJECT_DIR_MANGLED" ]; then
     PROJECT_DIR_MANGLED="-"
@@ -39,15 +92,17 @@ if [ -d "$CLAUDE_PROJECT_DIR" ]; then
     EXISTING_SESSIONS=$(ls "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | sort)
 fi
 
-# Run Claude Code
-claude "$@"
+# Run Claude Code non-interactively
+# --print: non-interactive mode, print response and exit
+# --dangerously-skip-permissions: skip all permission dialogs (safe in supervised context)
+# --output-format json: structured output for easier parsing
+claude --print --dangerously-skip-permissions --output-format json "${EXTRA_ARGS[@]}" "$PROMPT"
 EXIT_CODE=$?
 
 # Find new session files
 NEW_SESSIONS=""
 if [ -d "$CLAUDE_PROJECT_DIR" ]; then
     CURRENT_SESSIONS=$(ls "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | sort)
-    # Find sessions that didn't exist before
     NEW_SESSIONS=$(comm -13 <(echo "$EXISTING_SESSIONS") <(echo "$CURRENT_SESSIONS") 2>/dev/null)
 fi
 
@@ -64,7 +119,9 @@ else
 fi
 
 # Record session end
-echo "[$SESSION_ID] END $(date -Iseconds) exit=$EXIT_CODE" >> "$SESSIONS_LOG"
-echo "" >> "$SESSIONS_LOG"
+{
+    echo "[$SESSION_ID] END $(date -Iseconds) exit=$EXIT_CODE"
+    echo ""
+} >> "$SESSIONS_LOG"
 
 exit $EXIT_CODE
