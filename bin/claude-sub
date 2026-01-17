@@ -2,7 +2,10 @@
 # claude-sub: Non-interactive Claude Code wrapper with automatic session archiving
 #
 # Usage: claude-sub <task-description> [prompt]
-#        claude-sub <task-description> --stdin  (read prompt from stdin)
+#        claude-sub <task-description> --stdin       (read prompt from stdin)
+#        claude-sub <task-description> --async       (run in background)
+#        claude-sub --status [task-id]               (check async task status)
+#        claude-sub --result [task-id]               (get async task result)
 #
 # Designed for use by graft Claudes calling Claude Code as a subagent.
 # Sessions are archived to ~/.claude-archive/ for later import into graft.
@@ -10,15 +13,57 @@
 # Examples:
 #   claude-sub "fix login bug" "Find and fix the authentication issue in auth.py"
 #   echo "Refactor the database module" | claude-sub "db refactor" --stdin
+#   claude-sub "investigate logs" "Check why the server is slow" --async
+#   claude-sub --status  # check latest async task
+#   claude-sub --result  # get latest async task output
 
 set -e
 
 ARCHIVE_DIR="$HOME/.claude-archive"
 SESSIONS_LOG="$ARCHIVE_DIR/sessions.log"
 RAW_DIR="$ARCHIVE_DIR/raw"
+RESULTS_DIR="$HOME/.claude-sub-results"
 
-# Ensure archive directories exist
-mkdir -p "$RAW_DIR"
+# Ensure directories exist
+mkdir -p "$RAW_DIR" "$RESULTS_DIR"
+
+# Handle --status command
+if [ "$1" = "--status" ]; then
+    TASK_ID="${2:-latest}"
+    if [ "$TASK_ID" = "latest" ]; then
+        TASK_ID=$(ls -t "$RESULTS_DIR"/*.status 2>/dev/null | head -1 | xargs -r basename | sed 's/\.status$//')
+    fi
+    if [ -z "$TASK_ID" ] || [ ! -f "$RESULTS_DIR/$TASK_ID.status" ]; then
+        echo "No async tasks found"
+        exit 1
+    fi
+    cat "$RESULTS_DIR/$TASK_ID.status"
+    exit 0
+fi
+
+# Handle --result command
+if [ "$1" = "--result" ]; then
+    TASK_ID="${2:-latest}"
+    if [ "$TASK_ID" = "latest" ]; then
+        TASK_ID=$(ls -t "$RESULTS_DIR"/*.status 2>/dev/null | head -1 | xargs -r basename | sed 's/\.status$//')
+    fi
+    if [ -z "$TASK_ID" ] || [ ! -f "$RESULTS_DIR/$TASK_ID.status" ]; then
+        echo "No async tasks found"
+        exit 1
+    fi
+    STATUS=$(cat "$RESULTS_DIR/$TASK_ID.status")
+    if [ "$STATUS" = "running" ]; then
+        echo "Task $TASK_ID is still running"
+        exit 1
+    fi
+    if [ -f "$RESULTS_DIR/$TASK_ID.out" ]; then
+        cat "$RESULTS_DIR/$TASK_ID.out"
+    else
+        echo "No output file found for $TASK_ID"
+        exit 1
+    fi
+    exit 0
+fi
 
 # Generate session ID
 SESSION_ID=$(date +%Y%m%d-%H%M%S)-$$
@@ -27,12 +72,17 @@ SESSION_ID=$(date +%Y%m%d-%H%M%S)-$$
 TASK_DESC=""
 PROMPT=""
 USE_STDIN=false
+ASYNC_MODE=false
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stdin)
             USE_STDIN=true
+            shift
+            ;;
+        --async|--background)
+            ASYNC_MODE=true
             shift
             ;;
         --*)
@@ -63,6 +113,9 @@ fi
 if [ -z "$TASK_DESC" ]; then
     echo "Usage: claude-sub <task-description> [prompt]" >&2
     echo "       claude-sub <task-description> --stdin" >&2
+    echo "       claude-sub <task-description> --async" >&2
+    echo "       claude-sub --status [task-id]" >&2
+    echo "       claude-sub --result [task-id]" >&2
     exit 1
 fi
 
@@ -76,6 +129,7 @@ fi
     echo "[$SESSION_ID] START $(date -Iseconds)"
     echo "[$SESSION_ID] TASK: $TASK_DESC"
     echo "[$SESSION_ID] CWD: $(pwd)"
+    echo "[$SESSION_ID] ASYNC: $ASYNC_MODE"
     echo "[$SESSION_ID] PROMPT: ${PROMPT:0:200}..."
 } >> "$SESSIONS_LOG"
 
@@ -92,38 +146,69 @@ if [ -d "$CLAUDE_PROJECT_DIR" ]; then
     EXISTING_SESSIONS=$(ls "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | sort)
 fi
 
-# Run Claude Code non-interactively
-# Unset API key to force Claude Code to use OAuth (Max plan) instead
-unset ANTHROPIC_API_KEY
-# --print: non-interactive mode, print response and exit
-# --dangerously-skip-permissions: skip all permission dialogs (safe in supervised context)
-# --output-format json: structured output for easier parsing
-claude --print --dangerously-skip-permissions --output-format json "${EXTRA_ARGS[@]}" "$PROMPT"
-EXIT_CODE=$?
+# Function to run claude and archive results
+run_claude() {
+    # Unset API key to force Claude Code to use OAuth (Max plan) instead
+    unset ANTHROPIC_API_KEY
+    
+    # Run Claude Code non-interactively
+    # --print: non-interactive mode, print response and exit
+    # --dangerously-skip-permissions: skip all permission dialogs (safe in supervised context)
+    # --output-format json: structured output for easier parsing
+    claude --print --dangerously-skip-permissions --output-format json "${EXTRA_ARGS[@]}" "$PROMPT"
+    EXIT_CODE=$?
+    
+    # Find new session files
+    NEW_SESSIONS=""
+    if [ -d "$CLAUDE_PROJECT_DIR" ]; then
+        CURRENT_SESSIONS=$(ls "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | sort)
+        NEW_SESSIONS=$(comm -13 <(echo "$EXISTING_SESSIONS") <(echo "$CURRENT_SESSIONS") 2>/dev/null)
+    fi
+    
+    # Archive new sessions
+    if [ -n "$NEW_SESSIONS" ]; then
+        for SESSION_FILE in $NEW_SESSIONS; do
+            BASENAME=$(basename "$SESSION_FILE")
+            ARCHIVE_NAME="${SESSION_ID}_${BASENAME}"
+            cp "$SESSION_FILE" "$RAW_DIR/$ARCHIVE_NAME"
+            echo "[$SESSION_ID] ARCHIVED: $ARCHIVE_NAME" >> "$SESSIONS_LOG"
+        done
+    else
+        echo "[$SESSION_ID] NO_SESSION_FILE" >> "$SESSIONS_LOG"
+    fi
+    
+    # Record session end
+    {
+        echo "[$SESSION_ID] END $(date -Iseconds) exit=$EXIT_CODE"
+        echo ""
+    } >> "$SESSIONS_LOG"
+    
+    return $EXIT_CODE
+}
 
-# Find new session files
-NEW_SESSIONS=""
-if [ -d "$CLAUDE_PROJECT_DIR" ]; then
-    CURRENT_SESSIONS=$(ls "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | sort)
-    NEW_SESSIONS=$(comm -13 <(echo "$EXISTING_SESSIONS") <(echo "$CURRENT_SESSIONS") 2>/dev/null)
-fi
-
-# Archive new sessions
-if [ -n "$NEW_SESSIONS" ]; then
-    for SESSION_FILE in $NEW_SESSIONS; do
-        BASENAME=$(basename "$SESSION_FILE")
-        ARCHIVE_NAME="${SESSION_ID}_${BASENAME}"
-        cp "$SESSION_FILE" "$RAW_DIR/$ARCHIVE_NAME"
-        echo "[$SESSION_ID] ARCHIVED: $ARCHIVE_NAME" >> "$SESSIONS_LOG"
-    done
+# Run in async mode or synchronous mode
+if [ "$ASYNC_MODE" = true ]; then
+    # Create status file
+    echo "running" > "$RESULTS_DIR/$SESSION_ID.status"
+    echo "$TASK_DESC" > "$RESULTS_DIR/$SESSION_ID.task"
+    
+    # Run in background, capturing output
+    (
+        run_claude > "$RESULTS_DIR/$SESSION_ID.out" 2>&1
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 0 ]; then
+            echo "complete" > "$RESULTS_DIR/$SESSION_ID.status"
+        else
+            echo "failed:$EXIT_CODE" > "$RESULTS_DIR/$SESSION_ID.status"
+        fi
+    ) &
+    
+    echo "Started async task: $SESSION_ID"
+    echo "Check status: claude-sub --status $SESSION_ID"
+    echo "Get result:   claude-sub --result $SESSION_ID"
+    exit 0
 else
-    echo "[$SESSION_ID] NO_SESSION_FILE" >> "$SESSIONS_LOG"
+    # Synchronous mode - just run it
+    run_claude
+    exit $?
 fi
-
-# Record session end
-{
-    echo "[$SESSION_ID] END $(date -Iseconds) exit=$EXIT_CODE"
-    echo ""
-} >> "$SESSIONS_LOG"
-
-exit $EXIT_CODE
