@@ -19,6 +19,39 @@
 
 set -e
 
+# Show help if no args or --help
+if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    cat << 'HELPEOF'
+claude-sub: Run Claude Code as a subagent with session archiving
+
+USAGE:
+  claude-sub <description> <prompt>           Synchronous (30s timeout from graft)
+  claude-sub <description> <prompt> --async   Background task, no timeout
+  claude-sub <description> --stdin            Read prompt from stdin
+  claude-sub --status [task-id]               Check async task status
+  claude-sub --result [task-id]               Get async task output
+
+EXAMPLES:
+  # Quick synchronous task
+  claude-sub "fix typo" "Fix the typo in README.md line 42"
+
+  # Complex async investigation  
+  claude-sub "debug auth" "Find why login fails for SSO users" --async
+  claude-sub --status    # check progress
+  claude-sub --result    # get findings
+
+  # Bulk operation with stdin
+  echo "Refactor all error handling to use Result types" | claude-sub "refactor" --stdin --async
+
+NOTES:
+  - Uses Claude Code with Max plan (not API credits)
+  - Sessions archived to ~/.claude-archive/ for later import to graft
+  - Results stored in ~/.claude-sub-results/
+  - Use --async for tasks that may take > 30 seconds
+HELPEOF
+    exit 0
+fi
+
 ARCHIVE_DIR="$HOME/.claude-archive"
 SESSIONS_LOG="$ARCHIVE_DIR/sessions.log"
 RAW_DIR="$ARCHIVE_DIR/raw"

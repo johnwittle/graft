@@ -1341,7 +1341,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         self.recent_tool_calls.append(now)
         
         if len(self.recent_tool_calls) >= 10:
-            return f"\n\n[Note: {len(self.recent_tool_calls)} tool calls in the last 60 seconds. Consider adding sleep between checks of long-running processes to reduce API costs.]"
+            return f"\n\n[Note: {len(self.recent_tool_calls)} tool calls in the last 60 seconds. For bulk operations or complex tasks, consider `claude-sub --async 'description' 'prompt'` to delegate to Claude Code (uses Max plan instead of API credits). Or add sleep between polling checks.]"
         return ""
 
     def _update_stats(self, usage):
