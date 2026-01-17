@@ -221,27 +221,61 @@ run_claude() {
 
 # Run in async mode or synchronous mode
 if [ "$ASYNC_MODE" = true ]; then
-    # Create status file
+    # ASYNC MODE: Must return to caller within seconds, before graft's 30s timeout.
+    # We use screen -dmS to fully detach immediately.
+    
+    # Create status/task files (fast, do this before detaching)
     echo "running" > "$RESULTS_DIR/$SESSION_ID.status"
     echo "$TASK_DESC" > "$RESULTS_DIR/$SESSION_ID.task"
+    echo "$PROMPT" > "$RESULTS_DIR/$SESSION_ID.prompt"
     
-    # Run in background, capturing output
-    (
-        run_claude > "$RESULTS_DIR/$SESSION_ID.out" 2>&1
-        EXIT_CODE=$?
-        if [ $EXIT_CODE -eq 0 ]; then
-            echo "complete" > "$RESULTS_DIR/$SESSION_ID.status"
-        else
-            echo "failed:$EXIT_CODE" > "$RESULTS_DIR/$SESSION_ID.status"
-        fi
-    ) &
+    # Record in sessions log
+    echo "[$SESSION_ID] ASYNC_STARTED $(date -Iseconds)" >> "$SESSIONS_LOG"
+    
+    # Create a runner script for screen to execute
+    RUNNER="$RESULTS_DIR/$SESSION_ID.runner.sh"
+    CURRENT_DIR="$(pwd)"
+    cat > "$RUNNER" << RUNNEREOF
+#!/bin/bash
+cd "$CURRENT_DIR"
+export HOME="$HOME"
+unset ANTHROPIC_API_KEY
+
+# Run Claude Code non-interactively
+claude --print --dangerously-skip-permissions --output-format json $PROMPT > "$RESULTS_DIR/$SESSION_ID.out" 2>&1
+EXIT_CODE=\$?
+
+# Update status
+if [ \$EXIT_CODE -eq 0 ]; then
+    echo "complete" > "$RESULTS_DIR/$SESSION_ID.status"
+else
+    echo "failed:\$EXIT_CODE" > "$RESULTS_DIR/$SESSION_ID.status"
+fi
+
+# Log completion
+echo "[$SESSION_ID] END \$(date -Iseconds) exit=\$EXIT_CODE" >> "$SESSIONS_LOG"
+
+# Archive any new session files
+PROJECT_DIR_MANGLED=\$(echo "$CURRENT_DIR" | sed 's|^/||; s|/|-|g')
+if [ -z "\$PROJECT_DIR_MANGLED" ]; then PROJECT_DIR_MANGLED="-"; fi
+CLAUDE_PROJECT_DIR="\$HOME/.claude/projects/-\$PROJECT_DIR_MANGLED"
+if [ -d "\$CLAUDE_PROJECT_DIR" ]; then
+    for f in "\$CLAUDE_PROJECT_DIR"/*.jsonl; do
+        [ -f "\$f" ] && cp "\$f" "$RAW_DIR/${SESSION_ID}_\$(basename "\$f")" 2>/dev/null
+    done
+fi
+RUNNEREOF
+    chmod +x "$RUNNER"
+    
+    # Launch with screen - returns IMMEDIATELY
+    screen -dmS "claude-$SESSION_ID" "$RUNNER"
     
     echo "Started async task: $SESSION_ID"
     echo "Check status: claude-sub --status $SESSION_ID"
     echo "Get result:   claude-sub --result $SESSION_ID"
     exit 0
 else
-    # Synchronous mode - just run it
+    # Synchronous mode - just run it directly
     run_claude
     exit $?
 fi
