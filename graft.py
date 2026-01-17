@@ -1509,8 +1509,11 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 
                 # Continue the loop - Claude will respond to tool results
             
-            # Show final stats (cumulative for entire turn including tool calls)
-            if turn_input_tokens > 0:
+            # Show final stats
+            if hasattr(response, 'usage'):
+                # Context size is from the final API call (current conversation size)
+                context_size = response.usage.input_tokens
+                
                 cache_info = ""
                 if turn_cache_creation > 0:
                     cache_info = f", cache write: {turn_cache_creation:,}"
@@ -1518,16 +1521,16 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                     cache_info = f", cache read: {turn_cache_read:,}"
                 
                 web_info = ""
-                if hasattr(response, 'usage'):
-                    server_tool_use = getattr(response.usage, 'server_tool_use', None)
-                    if server_tool_use and getattr(server_tool_use, 'web_search_requests', 0):
-                        web_info = f", web: {server_tool_use.web_search_requests}"
+                server_tool_use = getattr(response.usage, 'server_tool_use', None)
+                if server_tool_use and getattr(server_tool_use, 'web_search_requests', 0):
+                    web_info = f", web: {server_tool_use.web_search_requests}"
                 
                 tools_info = ""
                 if total_tool_calls > 0:
                     tools_info = f", tools: {total_tool_calls}"
                 
-                print(f"\n[in: {turn_input_tokens:,}, out: {turn_output_tokens:,}{cache_info}{web_info}{tools_info}, stop: {response.stop_reason}]")
+                # Show context size (how close to 200k limit) and output tokens
+                print(f"\n[ctx: {context_size:,}, out: {turn_output_tokens:,}{cache_info}{web_info}{tools_info}, stop: {response.stop_reason}]")
         
         except Exception as e:
             print(f"\nError: {e}")
