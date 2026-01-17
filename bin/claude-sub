@@ -241,8 +241,11 @@ cd "$CURRENT_DIR"
 export HOME="$HOME"
 unset ANTHROPIC_API_KEY
 
+# Read prompt from file (handles multi-line and special characters safely)
+PROMPT_FILE="$RESULTS_DIR/$SESSION_ID.prompt"
+
 # Run Claude Code non-interactively
-claude --print --dangerously-skip-permissions --output-format json $PROMPT > "$RESULTS_DIR/$SESSION_ID.out" 2>&1
+claude --print --dangerously-skip-permissions --output-format json "\$(cat "\$PROMPT_FILE")" > "$RESULTS_DIR/$SESSION_ID.out" 2>&1
 EXIT_CODE=\$?
 
 # Update status
