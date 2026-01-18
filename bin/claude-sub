@@ -241,6 +241,20 @@ cd "$CURRENT_DIR"
 export HOME="$HOME"
 unset ANTHROPIC_API_KEY
 
+# Trap to archive session files even if we get killed
+archive_session() {
+    PROJECT_DIR_MANGLED=\$(echo "$CURRENT_DIR" | sed 's|^/||; s|/|-|g')
+    if [ -z "\$PROJECT_DIR_MANGLED" ]; then PROJECT_DIR_MANGLED="-"; fi
+    CLAUDE_PROJECT_DIR="\$HOME/.claude/projects/-\$PROJECT_DIR_MANGLED"
+    if [ -d "\$CLAUDE_PROJECT_DIR" ]; then
+        for f in "\$CLAUDE_PROJECT_DIR"/*.jsonl; do
+            [ -f "\$f" ] && cp "\$f" "$RAW_DIR/${SESSION_ID}_\$(basename "\$f")" 2>/dev/null
+        done
+    fi
+    echo "[$SESSION_ID] ARCHIVED_ON_EXIT \$(date -Iseconds)" >> "$SESSIONS_LOG"
+}
+trap archive_session EXIT
+
 # Read prompt from file (handles multi-line and special characters safely)
 PROMPT_FILE="$RESULTS_DIR/$SESSION_ID.prompt"
 
