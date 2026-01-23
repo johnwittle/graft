@@ -26,93 +26,90 @@ def parse_jsonl(filepath):
                     print(f"Warning: skipping malformed line: {e}", file=sys.stderr)
 
 
-def normalize_content(content):
-    """Normalize content to string or list format."""
-    if isinstance(content, str):
-        return content.rstrip('\n')
-    elif isinstance(content, list):
-        # If it's a single text block, simplify to string
-        if len(content) == 1 and isinstance(content[0], dict) and content[0].get('type') == 'text':
-            return content[0].get('text', '').rstrip('\n')
-        # Otherwise keep as list
-        return content
-    else:
-        return str(content)
-
-
 def extract_messages(events):
-    """Extract user/assistant messages from Claude Code events."""
-    messages = []
-    seen_assistant_ids = set()  # Claude Code sends multiple events per response
+    """
+    Extract user/assistant messages from Claude Code events.
+    
+    Claude Code streams assistant messages as multiple events with the same message ID,
+    each containing different content blocks. We need to accumulate all blocks for each
+    message ID, then emit them in the order they appear.
+    """
+    # First pass: collect all events and group assistant content by message ID
+    assistant_content_by_id = {}  # msg_id -> list of content blocks
+    assistant_order = []  # track order of first appearance of each msg_id
+    
+    ordered_events = []  # (event_type, data) tuples in order
     
     for event in events:
         event_type = event.get('type')
+        uuid = event.get('uuid')
         
         if event_type == 'user':
             msg = event.get('message', {})
             content = msg.get('content', '')
             if content:
-                messages.append({
-                    'role': 'user',
-                    'content': normalize_content(content)
-                })
-                
+                # Check if this is a tool_result (list with tool_result blocks)
+                if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get('type') == 'tool_result' 
+                    for b in content
+                ):
+                    ordered_events.append(('tool_result', content, uuid))
+                else:
+                    ordered_events.append(('user', content, uuid))
+                    
         elif event_type == 'assistant':
             msg = event.get('message', {})
             msg_id = msg.get('id')
-            
-            # Skip if we've already processed this message
-            # (Claude Code sends partial updates as separate events)
-            if msg_id and msg_id in seen_assistant_ids:
-                # Update the last message with this ID if content is longer
-                content_blocks = msg.get('content', [])
-                if content_blocks and messages:
-                    for i in range(len(messages) - 1, -1, -1):
-                        if messages[i].get('_msg_id') == msg_id:
-                            new_content = normalize_content(content_blocks)
-                            old_content = messages[i].get('content', '')
-                            # Keep the longer/more complete version
-                            if isinstance(new_content, str) and isinstance(old_content, str):
-                                if len(new_content) > len(old_content):
-                                    messages[i]['content'] = new_content
-                            elif isinstance(new_content, list):
-                                messages[i]['content'] = new_content
-                            break
-                continue
-            
             content_blocks = msg.get('content', [])
-            if content_blocks:
-                message_entry = {
-                    'role': 'assistant',
-                    'content': normalize_content(content_blocks)
-                }
-                if msg_id:
-                    message_entry['_msg_id'] = msg_id
-                    seen_assistant_ids.add(msg_id)
-                messages.append(message_entry)
-        
-        elif event_type == 'tool_result':
-            # Tool results from user side
-            msg = event.get('message', {})
-            content = msg.get('content', [])
-            tool_use_id = None
             
-            # Find tool_use_id
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get('type') == 'tool_result':
-                        tool_use_id = block.get('tool_use_id')
-                        break
-            
-            if content:
-                messages.append({
-                    'role': 'user',
-                    'content': content if isinstance(content, list) else [{'type': 'tool_result', 'content': str(content)}]
-                })
+            if msg_id and content_blocks:
+                if msg_id not in assistant_content_by_id:
+                    assistant_content_by_id[msg_id] = []
+                    assistant_order.append(msg_id)
+                    ordered_events.append(('assistant', msg_id, uuid))
+                
+                # Accumulate content blocks
+                for block in content_blocks:
+                    # Check if we already have this block (by comparing structure)
+                    is_duplicate = False
+                    for existing in assistant_content_by_id[msg_id]:
+                        if block == existing:
+                            is_duplicate = True
+                            break
+                        # Also check for same tool_use id
+                        if (block.get('type') == 'tool_use' and 
+                            existing.get('type') == 'tool_use' and
+                            block.get('id') == existing.get('id')):
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        assistant_content_by_id[msg_id].append(block)
     
-    # Clean up internal tracking fields
-    for msg in messages:
-        msg.pop('_msg_id', None)
+    # Second pass: build messages in order
+    messages = []
+    
+    for event_type, data, uuid in ordered_events:
+        if event_type == 'user':
+            content = data
+            if isinstance(content, str):
+                content = content.rstrip('\n')
+            messages.append({'role': 'user', 'content': content})
+            
+        elif event_type == 'assistant':
+            msg_id = data
+            content_blocks = assistant_content_by_id.get(msg_id, [])
+            if content_blocks:
+                # Simplify if it's just a single text block
+                if (len(content_blocks) == 1 and 
+                    isinstance(content_blocks[0], dict) and 
+                    content_blocks[0].get('type') == 'text'):
+                    content = content_blocks[0].get('text', '').rstrip('\n')
+                else:
+                    content = content_blocks
+                messages.append({'role': 'assistant', 'content': content})
+                
+        elif event_type == 'tool_result':
+            messages.append({'role': 'user', 'content': data})
     
     return messages
 
