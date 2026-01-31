@@ -706,7 +706,7 @@ class ToolExecutor:
             return "\n".join(output) if output else "(no output)"
 
         except subprocess.TimeoutExpired:
-            return "Error: Command timed out and was killed after 30 seconds. For long-running commands, use screen -dmS name command, or redirect output to a file."
+            return "Error: Command timed out and was killed after 30 seconds. Note: any child processes spawned by this command may still be running (check with `pgrep` or `ps aux`). For long-running commands, use `screen -dmS name command` to fully detach, then `screen -r name` to check on it."
         except Exception as e:
             return f"Error: {type(e).__name__}: {e}"
 
