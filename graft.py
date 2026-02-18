@@ -246,6 +246,7 @@ class Conversation:
         self.web_search = False
         self.tools_path = None  # Path string if tools enabled
         self.shell_enabled = False
+        self.thinking_budget = 0  # 0 = disabled
     
     @classmethod
     def load(cls, name):
@@ -267,6 +268,7 @@ class Conversation:
         conv.web_search = data.get("web_search", False)
         conv.tools_path = data.get("tools_path", None)
         conv.shell_enabled = data.get("shell_enabled", False)
+        conv.thinking_budget = data.get("thinking_budget", 0)
         
         return conv
     
@@ -330,6 +332,7 @@ class Conversation:
             'web_search': self.web_search,
             'tools_path': self.tools_path,
             'shell_enabled': self.shell_enabled,
+            'thinking_budget': self.thinking_budget,
         }
         
         path = CONVERSATIONS_DIR / f"{self.name}.json"
@@ -793,12 +796,15 @@ class GraftSession:
                 self.tool_executor = None
                 self.tools_enabled = False
             self.shell_enabled = self.conversation.shell_enabled
+            self.config["thinking_budget"] = self.conversation.thinking_budget
             
             # Show tool status if any are enabled
             tools_status = []
             if self.web_search_enabled: tools_status.append("web")
             if self.tools_enabled: tools_status.append(f"tools:{self.conversation.tools_path}")
             if self.shell_enabled: tools_status.append("shell")
+            if self.config.get("thinking_budget", 0) > 0:
+                tools_status.append(f"thinking:{self.config['thinking_budget']}")
             if tools_status:
                 print("Restored settings: " + ", ".join(tools_status))
             # Show recent context
@@ -1097,6 +1103,8 @@ Commands:
                 return True
             if arg.lower() == 'off':
                 self.config['thinking_budget'] = 0
+                if self.conversation:
+                    self.conversation.thinking_budget = 0
                 print("Extended thinking disabled")
                 return True
             try:
@@ -1108,6 +1116,9 @@ Commands:
                     print("Thinking budget must be at most 128000 tokens")
                     return True
                 self.config['thinking_budget'] = new_val
+                if self.conversation:
+                    self.conversation.thinking_budget = new_val
+                    self.conversation.unsaved_changes = True
                 print(f"Extended thinking enabled with budget: {new_val:,} tokens")
             except ValueError:
                 print(f"Invalid number: {arg}")
