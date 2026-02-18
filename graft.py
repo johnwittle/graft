@@ -30,6 +30,7 @@ Commands during conversation:
   /cache on|off|5m|1h  - Control prompt caching
   /model [name]   - Show or switch model
   /max_tokens [n] - Show or set max output tokens
+  /thinking [n]  - Enable extended thinking with token budget
   /web on|off     - Toggle web search
   /tools [path]   - Enable file tools for a directory
   /tokens         - Show token estimates
@@ -60,6 +61,7 @@ DEFAULT_CONFIG = {
     "cache_ttl": "5m",
     "editing_mode": "emacs",
     "max_tokens": 8192,
+    "thinking_budget": 0,  # 0 = disabled, >1024 = enabled
     "web_search": False,
 }
 
@@ -851,6 +853,7 @@ Commands:
   /export [--tools] [file] - Export transcript to file
   /model [name]   - Show or switch model
   /max_tokens [n] - Show or set max output tokens
+  /thinking [n]  - Enable extended thinking with token budget
   /web on|off     - Toggle web search
   /tools [path]   - Enable file tools for path (or show status)
   /tools off      - Disable file tools
@@ -1062,6 +1065,34 @@ Commands:
                     return True
                 self.config['max_tokens'] = new_val
                 print(f"Max output tokens set to: {new_val:,}")
+            except ValueError:
+                print(f"Invalid number: {arg}")
+        
+        elif cmd == '/thinking':
+            current = self.config.get('thinking_budget', 0)
+            if not arg:
+                if current > 0:
+                    print(f"Extended thinking: ON (budget: {current:,} tokens)")
+                else:
+                    print("Extended thinking: OFF")
+                print("Usage: /thinking <budget>  (e.g., /thinking 10000)")
+                print("       /thinking off       (disable thinking)")
+                print("Note: minimum budget is 1024 tokens")
+                return True
+            if arg.lower() == 'off':
+                self.config['thinking_budget'] = 0
+                print("Extended thinking disabled")
+                return True
+            try:
+                new_val = int(arg)
+                if new_val < 1024:
+                    print("Thinking budget must be at least 1024 tokens")
+                    return True
+                if new_val > 128000:
+                    print("Thinking budget must be at most 128000 tokens")
+                    return True
+                self.config['thinking_budget'] = new_val
+                print(f"Extended thinking enabled with budget: {new_val:,} tokens")
             except ValueError:
                 print(f"Invalid number: {arg}")
         
@@ -1385,10 +1416,18 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         """
         Serialize response content blocks for storage in messages.
         Converts API objects to dicts that can be JSON serialized.
+        Preserves thinking blocks for multi-turn continuity.
         """
         serialized = []
         for block in content_blocks:
-            if hasattr(block, 'text'):
+            if hasattr(block, 'type') and block.type == 'thinking':
+                # Preserve thinking blocks - required for multi-turn with extended thinking
+                serialized.append({
+                    "type": "thinking",
+                    "thinking": getattr(block, 'thinking', ''),
+                    "signature": getattr(block, 'signature', None)
+                })
+            elif hasattr(block, 'text'):
                 serialized.append({"type": "text", "text": block.text})
             elif hasattr(block, 'type') and block.type == 'tool_use':
                 serialized.append({
@@ -1438,14 +1477,44 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 if tools:
                     request_kwargs["tools"] = tools
                 
+                # Add extended thinking if enabled
+                thinking_budget = self.config.get('thinking_budget', 0)
+                if thinking_budget >= 1024:
+                    request_kwargs["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": thinking_budget
+                    }
+                
                 # Make streaming API call
                 with self.client.messages.stream(**request_kwargs) as stream:
                     response_text = ""
+                    thinking_text = ""
+                    in_thinking = False
                     
-                    # Stream text as it arrives
-                    for text in stream.text_stream:
-                        print(text, end="", flush=True)
-                        response_text += text
+                    # Stream events to handle both thinking and text
+                    for event in stream:
+                        if hasattr(event, 'type'):
+                            if event.type == 'content_block_start':
+                                block = getattr(event, 'content_block', None)
+                                if block and getattr(block, 'type', None) == 'thinking':
+                                    in_thinking = True
+                                    print("[Thinking...] ", end="", flush=True)
+                                elif block and getattr(block, 'type', None) == 'text':
+                                    in_thinking = False
+                            elif event.type == 'content_block_delta':
+                                delta = getattr(event, 'delta', None)
+                                if delta:
+                                    if getattr(delta, 'type', None) == 'thinking_delta':
+                                        thinking_text += getattr(delta, 'thinking', '')
+                                    elif getattr(delta, 'type', None) == 'text_delta':
+                                        text = getattr(delta, 'text', '')
+                                        print(text, end="", flush=True)
+                                        response_text += text
+                            elif event.type == 'content_block_stop':
+                                if in_thinking:
+                                    print(f"[{len(thinking_text)} chars]", flush=True)
+                                    print("Claude: ", end="", flush=True)
+                                    in_thinking = False
                     
                     # Get the final message for metadata
                     response = stream.get_final_message()
