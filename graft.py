@@ -25,8 +25,8 @@ Commands during conversation:
   /new            - Start fresh conversation
   /rename <name>  - Rename current conversation
   /delete <n>  - Delete a saved conversation
-  /read [--tools]  - View full transcript in pager
-  /export [--tools] [file] - Export transcript to file
+  /read [--tools] [--thinking] - View transcript in pager
+  /export [--tools] [--thinking] [file] - Export transcript
   /cache on|off|5m|1h  - Control prompt caching
   /model [name]   - Show or switch model
   /max_tokens [n] - Show or set max output tokens
@@ -394,7 +394,7 @@ def format_conversation_list(convos):
 
 # === Transcript Formatting ===
 
-def format_message(msg, width=80, include_tools=False):
+def format_message(msg, width=80, include_tools=False, include_thinking=False):
     """Format a single message for display."""
     role = msg.get('role', 'unknown')
     content = msg.get('content', '')
@@ -406,6 +406,9 @@ def format_message(msg, width=80, include_tools=False):
             if isinstance(block, dict):
                 if 'text' in block:
                     text_parts.append(block['text'])
+                elif include_thinking and block.get('type') == 'thinking':
+                    thinking_content = block.get('thinking', '')
+                    text_parts.append(f"[Thinking]\n{thinking_content}\n[/Thinking]")
                 elif include_tools and block.get('type') == 'tool_use':
                     tool_name = block.get('name', 'unknown')
                     tool_input = block.get('input', {})
@@ -431,14 +434,14 @@ def format_message(msg, width=80, include_tools=False):
     
     return f"{header}\n{content}"
 
-def format_transcript(messages, last_n=None, include_tools=False):
+def format_transcript(messages, last_n=None, include_tools=False, include_thinking=False):
     """Format messages as human-readable transcript."""
     if last_n:
         messages = messages[-last_n:]
     
     parts = []
     for msg in messages:
-        parts.append(format_message(msg, include_tools=include_tools))
+        parts.append(format_message(msg, include_tools=include_tools, include_thinking=include_thinking))
     
     separator = "\n\n" + ("-" * 40) + "\n\n"
     return separator.join(parts)
@@ -849,8 +852,8 @@ Commands:
   /rename <name>  - Rename current conversation
   /cache on|off|5m|1h  - Control prompt caching
   /delete <name>  - Delete a saved conversation
-  /read [--tools]  - View full transcript in pager
-  /export [--tools] [file] - Export transcript to file
+  /read [--tools] [--thinking] - View transcript in pager
+  /export [--tools] [--thinking] [file] - Export transcript
   /model [name]   - Show or switch model
   /max_tokens [n] - Show or set max output tokens
   /thinking [n]  - Enable extended thinking with token budget
@@ -937,8 +940,14 @@ Commands:
                 print("No conversation to read.")
                 return True
             
-            include_tools = arg and arg.lower() in ('tools', '--tools', '-t')
-            transcript = format_transcript(self.conversation.messages, include_tools=include_tools)
+            # Parse flags
+            include_tools = False
+            include_thinking = False
+            if arg:
+                flags = arg.lower().split()
+                include_tools = any(f in ('tools', '--tools', '-t') for f in flags)
+                include_thinking = any(f in ('thinking', '--thinking') for f in flags)
+            transcript = format_transcript(self.conversation.messages, include_tools=include_tools, include_thinking=include_thinking)
             show_in_pager(transcript)
         
         elif cmd == '/export':
@@ -946,14 +955,17 @@ Commands:
                 print("No conversation to export.")
                 return True
             
-            # Parse arguments: /export [--tools] [filename]
+            # Parse arguments: /export [--tools] [--thinking] [filename]
             include_tools = False
+            include_thinking = False
             filename = None
             if arg:
                 parts = arg.split()
                 for part in parts:
                     if part.lower() in ('tools', '--tools', '-t'):
                         include_tools = True
+                    elif part.lower() in ('thinking', '--thinking'):
+                        include_thinking = True
                     else:
                         filename = part
             
@@ -966,9 +978,13 @@ Commands:
             
             # Ensure parent directory exists
             Path(filename).parent.mkdir(parents=True, exist_ok=True)
-            transcript = format_transcript(self.conversation.messages, include_tools=include_tools)
+            transcript = format_transcript(self.conversation.messages, include_tools=include_tools, include_thinking=include_thinking)
             Path(filename).write_text(transcript, encoding='utf-8')
-            print(f"Exported to {filename}" + (" (with tools)" if include_tools else ""))
+            flags_msg = []
+            if include_tools: flags_msg.append("tools")
+            if include_thinking: flags_msg.append("thinking")
+            suffix = f" (with {', '.join(flags_msg)})" if flags_msg else ""
+            print(f"Exported to {filename}{suffix}")
         
         elif cmd == '/cache':
             if not arg:
