@@ -1555,18 +1555,11 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 # If no tool use, we're done
                 if response.stop_reason != "tool_use" or not tool_uses:
                     # Save assistant response to history
-                    if response.stop_reason == "tool_use":
-                        # Store full content including tool_use blocks
-                        self.conversation.messages.append({
-                            "role": "assistant",
-                            "content": self._serialize_content(response.content)
-                        })
-                    else:
-                        # Just text
-                        self.conversation.messages.append({
-                            "role": "assistant", 
-                            "content": response_text
-                        })
+                    # Always use _serialize_content to preserve thinking blocks
+                    self.conversation.messages.append({
+                        "role": "assistant",
+                        "content": self._serialize_content(response.content)
+                    })
                     break
                 
                 # Handle tool use
