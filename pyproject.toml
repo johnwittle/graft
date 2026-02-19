@@ -14,7 +14,7 @@ authors = [
     {name = "John"}
 ]
 dependencies = [
-    "anthropic>=0.18.0",
+    "anthropic>=0.40.0",
 ]
 
 [project.scripts]

@@ -114,6 +114,9 @@ editing_mode = "emacs"
 # Maximum response tokens
 max_tokens = 8192
 
+# Extended thinking budget (0 = disabled, minimum 1024 when enabled)
+thinking_budget = 0
+
 # Enable web search by default: true or false
 # Costs $10 per 1,000 searches. Must be enabled in Anthropic Console.
 web_search = false
@@ -335,7 +338,11 @@ class Conversation:
             'thinking_budget': self.thinking_budget,
         }
         
-        path = CONVERSATIONS_DIR / f"{self.name}.json"
+        # Sanitize name to prevent path traversal
+        safe_name = self.name.replace('/', '_').replace('\\', '_').replace('\0', '')
+        if not safe_name or safe_name.strip('.') == '':
+            raise ValueError("Invalid conversation name")
+        path = CONVERSATIONS_DIR / f"{safe_name}.json"
         path.write_text(json.dumps(data, indent=2), encoding='utf-8')
         self.unsaved_changes = False
         
@@ -397,7 +404,7 @@ def format_conversation_list(convos):
 
 # === Transcript Formatting ===
 
-def format_message(msg, width=80, include_tools=False, include_thinking=False):
+def format_message(msg, include_tools=False, include_thinking=False):
     """Format a single message for display."""
     role = msg.get('role', 'unknown')
     content = msg.get('content', '')
@@ -415,9 +422,9 @@ def format_message(msg, width=80, include_tools=False, include_thinking=False):
                 elif include_tools and block.get('type') == 'tool_use':
                     tool_name = block.get('name', 'unknown')
                     tool_input = block.get('input', {})
-                    # Format tool input compactly
-                    import json
-                    input_str = json.dumps(tool_input) if len(json.dumps(tool_input)) < 100 else json.dumps(tool_input)[:100] + '...'
+                    input_str = json.dumps(tool_input)
+                    if len(input_str) > 100:
+                        input_str = input_str[:100] + '...'
                     text_parts.append(f"[Tool: {tool_name}({input_str})]")
                 elif include_tools and block.get('type') == 'tool_result':
                     tool_content = block.get('content', '')
@@ -866,6 +873,7 @@ Commands:
   /web on|off     - Toggle web search
   /tools [path]   - Enable file tools for path (or show status)
   /tools off      - Disable file tools
+  /shell on|off   - Enable/disable shell commands
   /tokens         - Show token estimate
   /compress        - Compress conversation to reduce token count
   /system [text]  - Set/show system prompt
@@ -1206,7 +1214,7 @@ Commands:
         current_content = []
         
         # Patterns that indicate a user turn
-        user_patterns = re.compile(r'^(User|U\d+|Human|H\d*|John|0x7A92):\s*', re.IGNORECASE)
+        user_patterns = re.compile(r'^(User|U\d+|Human|H\d*):\s*', re.IGNORECASE)
         # Patterns that indicate an assistant turn
         assistant_patterns = re.compile(r'^(Assistant|A\d+|Claude|C\d*):\s*', re.IGNORECASE)
         
@@ -1644,9 +1652,8 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
             print(f"\nError: {e}")
             import traceback
             traceback.print_exc()
-            # Rollback - remove the user message we added
-            if self.conversation.messages and self.conversation.messages[-1].get('role') == 'user':
-                self.conversation.messages.pop()
+            # Rollback all messages added during this failed send
+            self.conversation.messages = self.conversation.messages[:rollback_point]
 
     def run(self):
         """Main REPL loop."""
