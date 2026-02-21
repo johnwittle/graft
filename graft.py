@@ -166,8 +166,8 @@ def convert_socketteer_format(data, include_thinking=True, include_tool_use=True
     Handles:
     - sender → role mapping
     - Content block extraction (text, thinking, tool_use, tool_result)
+    - Splits tool_results into separate user messages (API requirement)
     - Preserves structured blocks (thinking, tool_use) for API compatibility
-    - Merging consecutive same-role messages
     
     By default includes everything for full continuity.
     """
@@ -184,8 +184,9 @@ def convert_socketteer_format(data, include_thinking=True, include_tool_use=True
         else:
             continue  # Skip unknown senders
         
-        # Build content blocks - preserve structure for thinking/tool_use
-        content_blocks = []
+        # Separate blocks by type - tool_results must go in user messages
+        assistant_blocks = []
+        tool_result_blocks = []
         
         for block in msg.get('content', []):
             block_type = block.get('type', '')
@@ -193,21 +194,20 @@ def convert_socketteer_format(data, include_thinking=True, include_tool_use=True
             if block_type == 'text':
                 text = block.get('text', '')
                 if text:
-                    content_blocks.append({'type': 'text', 'text': text})
+                    assistant_blocks.append({'type': 'text', 'text': text})
             
             elif block_type == 'thinking':
                 if include_thinking:
                     thinking = block.get('thinking', '')
                     if thinking:
-                        # Preserve as structured block for API compatibility
                         thinking_block = {'type': 'thinking', 'thinking': thinking}
                         if block.get('signature'):
                             thinking_block['signature'] = block['signature']
-                        content_blocks.append(thinking_block)
+                        assistant_blocks.append(thinking_block)
             
             elif block_type == 'tool_use':
                 if include_tool_use:
-                    content_blocks.append({
+                    assistant_blocks.append({
                         'type': 'tool_use',
                         'id': block.get('id', ''),
                         'name': block.get('name', 'unknown'),
@@ -216,51 +216,56 @@ def convert_socketteer_format(data, include_thinking=True, include_tool_use=True
             
             elif block_type == 'tool_result':
                 if include_tool_use:
-                    # Sanitize tool_result content - API rejects extra fields like 'uuid'
+                    # Sanitize content - API rejects extra fields like 'uuid'
                     raw_content = block.get('content', '')
                     if isinstance(raw_content, list):
                         sanitized = []
                         for item in raw_content:
                             if isinstance(item, dict) and item.get('type') == 'text':
                                 sanitized.append({'type': 'text', 'text': item.get('text', '')})
-                            elif isinstance(item, dict):
-                                # Keep only type and expected fields
-                                sanitized.append({'type': item.get('type', 'text'), 'text': str(item)})
                             else:
-                                sanitized.append(item)
-                        tool_content = sanitized
+                                sanitized.append(str(item) if not isinstance(item, str) else item)
+                        tool_content = sanitized if sanitized else ''
                     else:
                         tool_content = raw_content
-                    content_blocks.append({
+                    tool_result_blocks.append({
                         'type': 'tool_result',
                         'tool_use_id': block.get('tool_use_id', ''),
                         'content': tool_content
                     })
         
-        if not content_blocks:
-            continue
+        # Helper to simplify content
+        def simplify_content(blocks):
+            if not blocks:
+                return None
+            has_structured = any(b.get('type') in ('thinking', 'tool_use', 'tool_result') for b in blocks)
+            if has_structured:
+                return blocks
+            text_parts = [b['text'] for b in blocks if b.get('type') == 'text']
+            return '\n\n'.join(text_parts) if text_parts else None
+        
+        # Add assistant content (for assistant messages) or user content (for user messages)
+        if role == 'assistant':
+            content = simplify_content(assistant_blocks)
+            if content:
+                messages.append({'role': 'assistant', 'content': content})
             
-        # Determine if we need structured content or can simplify to string
-        has_structured = any(b.get('type') in ('thinking', 'tool_use', 'tool_result') for b in content_blocks)
+            # Tool results go in a separate user message
+            if tool_result_blocks:
+                messages.append({'role': 'user', 'content': tool_result_blocks})
         
-        if has_structured:
-            content = content_blocks
-        else:
-            # Simple text-only message - flatten to string
-            text_parts = [b['text'] for b in content_blocks if b.get('type') == 'text']
-            content = '\n\n'.join(text_parts)
-        
-        # Merge with previous if same role and both are strings
-        if (messages and messages[-1]['role'] == role and 
-            isinstance(messages[-1]['content'], str) and isinstance(content, str)):
-            messages[-1]['content'] = f"{messages[-1]['content']}\n\n{content}"
-        else:
-            messages.append({'role': role, 'content': content})
+        elif role == 'user':
+            content = simplify_content(assistant_blocks)  # User messages only have text
+            if content:
+                # Merge with previous user message if possible
+                if (messages and messages[-1]['role'] == 'user' and 
+                    isinstance(messages[-1]['content'], str) and isinstance(content, str)):
+                    messages[-1]['content'] = f"{messages[-1]['content']}\n\n{content}"
+                else:
+                    messages.append({'role': 'user', 'content': content})
     
     return messages
 
-    
-    return merged
 
 class Conversation:
     """Manages a single conversation's state and metadata."""
