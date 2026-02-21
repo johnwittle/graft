@@ -216,10 +216,25 @@ def convert_socketteer_format(data, include_thinking=True, include_tool_use=True
             
             elif block_type == 'tool_result':
                 if include_tool_use:
+                    # Sanitize tool_result content - API rejects extra fields like 'uuid'
+                    raw_content = block.get('content', '')
+                    if isinstance(raw_content, list):
+                        sanitized = []
+                        for item in raw_content:
+                            if isinstance(item, dict) and item.get('type') == 'text':
+                                sanitized.append({'type': 'text', 'text': item.get('text', '')})
+                            elif isinstance(item, dict):
+                                # Keep only type and expected fields
+                                sanitized.append({'type': item.get('type', 'text'), 'text': str(item)})
+                            else:
+                                sanitized.append(item)
+                        tool_content = sanitized
+                    else:
+                        tool_content = raw_content
                     content_blocks.append({
                         'type': 'tool_result',
                         'tool_use_id': block.get('tool_use_id', ''),
-                        'content': block.get('content', '')
+                        'content': tool_content
                     })
         
         if not content_blocks:
