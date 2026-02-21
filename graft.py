@@ -503,11 +503,54 @@ def show_recent_messages(messages, n=4):
 
 # === Prompt Caching ===
 
+def strip_thinking_from_previous_turns(messages):
+    """
+    Remove thinking blocks from all but the last assistant message.
+    
+    The API automatically strips thinking from previous turns, but sending
+    thinking blocks with null/missing signatures causes validation errors.
+    We keep them in storage for /read --thinking, but filter here for API.
+    """
+    if not messages:
+        return messages
+    
+    # Find the last assistant message index
+    last_assistant_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get('role') == 'assistant':
+            last_assistant_idx = i
+            break
+    
+    result = []
+    for i, msg in enumerate(messages):
+        content = msg.get('content')
+        
+        # Only filter assistant messages before the last one
+        if msg.get('role') == 'assistant' and i < last_assistant_idx and isinstance(content, list):
+            # Filter out thinking blocks
+            filtered = [b for b in content if not (isinstance(b, dict) and b.get('type') == 'thinking')]
+            if filtered:
+                # Simplify to string if only text blocks remain
+                if all(b.get('type') == 'text' for b in filtered):
+                    text_parts = [b.get('text', '') for b in filtered]
+                    result.append({'role': 'assistant', 'content': '\n\n'.join(text_parts)})
+                else:
+                    result.append({'role': 'assistant', 'content': filtered})
+            # Skip empty messages entirely
+        else:
+            result.append(msg)
+    
+    return result
+
+
 def prepare_messages_for_cache(messages, cache_ttl="5m"):
     """
     Convert messages to cacheable format.
     Adds cache_control to the second-to-last human message (not tool_results).
     """
+    # Strip thinking blocks from previous turns (API validation)
+    messages = strip_thinking_from_previous_turns(messages)
+    
     if cache_ttl == "off" or len(messages) < 2:
         return messages
     
@@ -1502,6 +1545,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         turn_cache_creation = 0
         turn_cache_read = 0
         
+        rollback_point = len(self.conversation.messages) - 1  # Before user message we just added
         try:
             print("\nClaude: ", end="", flush=True)
             
