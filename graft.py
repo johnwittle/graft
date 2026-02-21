@@ -166,6 +166,7 @@ def convert_socketteer_format(data, include_thinking=True, include_tool_use=True
     Handles:
     - sender → role mapping
     - Content block extraction (text, thinking, tool_use, tool_result)
+    - Preserves structured blocks (thinking, tool_use) for API compatibility
     - Merging consecutive same-role messages
     
     By default includes everything for full continuity.
@@ -183,8 +184,8 @@ def convert_socketteer_format(data, include_thinking=True, include_tool_use=True
         else:
             continue  # Skip unknown senders
         
-        # Extract text content from content blocks
-        text_parts = []
+        # Build content blocks - preserve structure for thinking/tool_use
+        content_blocks = []
         
         for block in msg.get('content', []):
             block_type = block.get('type', '')
@@ -192,45 +193,58 @@ def convert_socketteer_format(data, include_thinking=True, include_tool_use=True
             if block_type == 'text':
                 text = block.get('text', '')
                 if text:
-                    text_parts.append(text)
+                    content_blocks.append({'type': 'text', 'text': text})
             
             elif block_type == 'thinking':
                 if include_thinking:
                     thinking = block.get('thinking', '')
                     if thinking:
-                        text_parts.append(f"[Thinking]\n{thinking}\n[/Thinking]")
+                        # Preserve as structured block for API compatibility
+                        content_blocks.append({
+                            'type': 'thinking',
+                            'thinking': thinking,
+                            'signature': block.get('signature')  # May be None for old exports
+                        })
             
             elif block_type == 'tool_use':
                 if include_tool_use:
-                    tool_name = block.get('name', 'unknown')
-                    tool_input = json.dumps(block.get('input', {}), indent=2)
-                    text_parts.append(f"[Tool: {tool_name}]\n{tool_input}")
+                    content_blocks.append({
+                        'type': 'tool_use',
+                        'id': block.get('id', ''),
+                        'name': block.get('name', 'unknown'),
+                        'input': block.get('input', {})
+                    })
             
             elif block_type == 'tool_result':
                 if include_tool_use:
-                    content = block.get('content', [])
-                    if isinstance(content, list) and content:
-                        first_item = content[0]
-                        if isinstance(first_item, dict):
-                            title = first_item.get('title', '')[:100]
-                            text_parts.append(f"[Tool Result: {title}...]")
+                    content_blocks.append({
+                        'type': 'tool_result',
+                        'tool_use_id': block.get('tool_use_id', ''),
+                        'content': block.get('content', '')
+                    })
         
-        # Combine text parts
-        combined_text = '\n\n'.join(text_parts)
+        if not content_blocks:
+            continue
+            
+        # Determine if we need structured content or can simplify to string
+        has_structured = any(b.get('type') in ('thinking', 'tool_use', 'tool_result') for b in content_blocks)
         
-        if combined_text.strip():
-            messages.append({
-                'role': role,
-                'content': combined_text
-            })
-    
-    # Merge consecutive messages with same role (API requirement)
-    merged = []
-    for msg in messages:
-        if merged and merged[-1]['role'] == msg['role']:
-            merged[-1]['content'] += '\n\n' + msg['content']
+        if has_structured:
+            content = content_blocks
         else:
-            merged.append(msg)
+            # Simple text-only message - flatten to string
+            text_parts = [b['text'] for b in content_blocks if b.get('type') == 'text']
+            content = '\n\n'.join(text_parts)
+        
+        # Merge with previous if same role and both are strings
+        if (messages and messages[-1]['role'] == role and 
+            isinstance(messages[-1]['content'], str) and isinstance(content, str)):
+            messages[-1]['content'] = f"{messages[-1]['content']}\n\n{content}"
+        else:
+            messages.append({'role': role, 'content': content})
+    
+    return messages
+
     
     return merged
 
