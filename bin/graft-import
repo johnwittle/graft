@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""
+Convert a socketteer Claude conversation export to graft conversation format.
+
+Usage: graft-import <input.json> [output.json] [--no-thinking] [--no-tool-use]
+
+If output is not specified, prints to stdout.
+The resulting JSON can be placed in ~/.graft/conversations/ and loaded with graft.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+
+def sanitize_tool_result_content(raw_content):
+    """Sanitize tool_result content — strip extra fields like uuid from text items."""
+    if isinstance(raw_content, list):
+        sanitized = []
+        for item in raw_content:
+            if isinstance(item, dict) and item.get('type') == 'text':
+                sanitized.append({'type': 'text', 'text': item.get('text', '')})
+            elif isinstance(item, str):
+                sanitized.append(item)
+            else:
+                sanitized.append(str(item))
+        return sanitized if sanitized else ''
+    return raw_content
+
+
+def convert_block(block, include_thinking, include_tool_use):
+    """
+    Convert a single socketteer content block to API format.
+    Returns the converted block, or None if it should be skipped.
+    """
+    block_type = block.get('type', '')
+
+    if block_type == 'text':
+        text = block.get('text', '')
+        if not text:
+            return None
+        return {'type': 'text', 'text': text}
+
+    elif block_type == 'thinking':
+        if not include_thinking:
+            return None
+        thinking = block.get('thinking', '')
+        if not thinking:
+            return None
+        result = {'type': 'thinking', 'thinking': thinking}
+        if block.get('signature'):
+            result['signature'] = block['signature']
+        return result
+
+    elif block_type == 'tool_use':
+        if not include_tool_use:
+            return None
+        return {
+            'type': 'tool_use',
+            'id': block.get('id', ''),
+            'name': block.get('name', 'unknown'),
+            'input': block.get('input', {})
+        }
+
+    elif block_type == 'tool_result':
+        if not include_tool_use:
+            return None
+        return {
+            'type': 'tool_result',
+            'tool_use_id': block.get('tool_use_id', ''),
+            'content': sanitize_tool_result_content(block.get('content', ''))
+        }
+
+    return None
+
+
+def simplify_content(blocks):
+    """Simplify a list of content blocks — collapse to plain string if only text."""
+    if not blocks:
+        return None
+    has_structured = any(b.get('type') in ('thinking', 'tool_use', 'tool_result') for b in blocks)
+    if has_structured:
+        return blocks
+    text_parts = [b['text'] for b in blocks if b.get('type') == 'text']
+    return '\n\n'.join(text_parts) if text_parts else None
+
+
+def convert_assistant_message(msg, include_thinking, include_tool_use):
+    """
+    Convert a socketteer assistant message into properly interleaved API messages.
+
+    The socketteer format puts tool_use and tool_result blocks within the same
+    assistant message in chronological order. The API expects:
+      assistant: [thinking, text, tool_use]
+      user: [tool_result]
+      assistant: [thinking, tool_use]
+      user: [tool_result]
+      assistant: [thinking, text]
+
+    We walk through blocks in order, splitting at tool_result boundaries.
+    """
+    messages = []
+    accumulated = []
+
+    for block in msg.get('content', []):
+        converted = convert_block(block, include_thinking, include_tool_use)
+        if converted is None:
+            continue
+
+        if converted['type'] == 'tool_result':
+            # Emit accumulated blocks as an assistant message
+            if accumulated:
+                content = simplify_content(accumulated)
+                if content:
+                    messages.append({'role': 'assistant', 'content': content})
+                accumulated = []
+
+            # Emit this tool_result as a user message
+            messages.append({'role': 'user', 'content': [converted]})
+        else:
+            accumulated.append(converted)
+
+    # Emit any remaining accumulated blocks
+    if accumulated:
+        content = simplify_content(accumulated)
+        if content:
+            messages.append({'role': 'assistant', 'content': content})
+
+    return messages
+
+
+def convert_human_message(msg):
+    """Convert a socketteer human message to API format."""
+    text_parts = []
+    for block in msg.get('content', []):
+        if block.get('type') == 'text':
+            text = block.get('text', '')
+            if text:
+                text_parts.append(text)
+    if text_parts:
+        return '\n\n'.join(text_parts)
+    return None
+
+
+def convert_socketteer(data, include_thinking=True, include_tool_use=True):
+    """
+    Convert socketteer Claude conversation export to graft API messages.
+
+    Handles proper interleaving of tool_use/tool_result across message boundaries.
+    """
+    messages = []
+
+    for msg in data.get('chat_messages', []):
+        sender = msg.get('sender', '')
+
+        if sender == 'human':
+            content = convert_human_message(msg)
+            if content is None:
+                continue
+            # Merge consecutive user messages
+            if (messages and messages[-1]['role'] == 'user'
+                    and isinstance(messages[-1]['content'], str)):
+                messages[-1]['content'] = f"{messages[-1]['content']}\n\n{content}"
+            else:
+                messages.append({'role': 'user', 'content': content})
+
+        elif sender == 'assistant':
+            new_messages = convert_assistant_message(
+                msg, include_thinking, include_tool_use
+            )
+            for m in new_messages:
+                # Merge consecutive user messages (tool_result after human)
+                if (m['role'] == 'user' and messages
+                        and messages[-1]['role'] == 'user'
+                        and isinstance(messages[-1]['content'], list)):
+                    messages[-1]['content'].extend(m['content'])
+                else:
+                    messages.append(m)
+
+    return messages
+
+
+def convert(input_path, output_path=None, include_thinking=True, include_tool_use=True):
+    """Convert socketteer export to graft conversation format."""
+    with open(input_path, 'r') as f:
+        data = json.load(f)
+
+    messages = convert_socketteer(data, include_thinking, include_tool_use)
+
+    if not messages:
+        print("Error: no messages extracted", file=sys.stderr)
+        return False
+
+    # Derive conversation name
+    name = data.get('name', '') or Path(input_path).stem
+
+    graft_conv = {
+        'name': name,
+        'created': data.get('created_at', ''),
+        'modified': data.get('updated_at', ''),
+        'model': data.get('model', 'claude-sonnet-4-5-20250929'),
+        'system_prompt': '',
+        'messages': messages,
+        'web_search': False,
+        'tools_path': None,
+        'shell_enabled': False
+    }
+
+    output_json = json.dumps(graft_conv, indent=2)
+
+    if output_path:
+        with open(output_path, 'w') as f:
+            f.write(output_json)
+        print(f"Converted {len(messages)} messages to {output_path}", file=sys.stderr)
+    else:
+        print(output_json)
+
+    # Print summary to stderr
+    roles = [m['role'] for m in messages]
+    print(f"  {len(messages)} messages: {', '.join(roles)}", file=sys.stderr)
+
+    # Validate interleaving
+    for i in range(1, len(roles)):
+        if roles[i] == roles[i - 1]:
+            print(f"  WARNING: consecutive {roles[i]} messages at index {i-1},{i}",
+                  file=sys.stderr)
+
+    return True
+
+
+def main():
+    if len(sys.argv) < 2 or '--help' in sys.argv or '-h' in sys.argv:
+        print(__doc__.strip())
+        sys.exit(1 if len(sys.argv) < 2 else 0)
+
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    flags = [a for a in sys.argv[1:] if a.startswith('--')]
+
+    input_path = args[0]
+    output_path = args[1] if len(args) > 1 else None
+
+    include_thinking = '--no-thinking' not in flags
+    include_tool_use = '--no-tool-use' not in flags
+
+    if not Path(input_path).exists():
+        print(f"Error: {input_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    success = convert(input_path, output_path, include_thinking, include_tool_use)
+    sys.exit(0 if success else 1)
+
+
+if __name__ == '__main__':
+    main()

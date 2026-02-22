@@ -1595,7 +1595,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 thinking_budget = self.config.get('thinking_budget', 0)
                 if thinking_budget >= 1024:
                     request_kwargs["thinking"] = {
-                        "type": "enabled",
+                        "type": "adaptive",
                         "budget_tokens": thinking_budget
                     }
                 
