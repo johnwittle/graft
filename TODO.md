@@ -5,6 +5,7 @@
 - ~~Extract socketteer import to separate file~~ → `bin/graft-import`
 - ~~Fix tool interleaving in imports~~ → proper assistant/user message splitting
 - ~~Update /thinking to use 'adaptive'~~ → fixed in graft.py
+- ~~Remove old convert_socketteer_format from graft.py~~ → replaced with subprocess call to `bin/graft-import`
 
 ## Medium Priority
 
@@ -13,9 +14,6 @@ The compression feature asks Claude to output "User:" and "Assistant:" markers, 
 
 ### Token estimation consistency
 `Conversation.token_estimate()` uses `// 2` ratio, but `/compress` uses `// 4`. Should unify or document why they differ.
-
-### Remove old convert_socketteer_format from graft.py
-Now that `bin/graft-import` exists, the inline converter in graft.py is redundant. Should be removed or simplified to just call the external tool.
 
 ## Low Priority / Backlog
 

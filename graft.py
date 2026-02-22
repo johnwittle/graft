@@ -159,112 +159,34 @@ def load_dotenv():
 
 # === Conversation Management ===
 
-def convert_socketteer_format(data, include_thinking=True, include_tool_use=True):
+def convert_socketteer_via_import(path, include_thinking=True, include_tool_use=True):
     """
-    Convert socketteer Claude Conversation Exporter format to API messages.
-    
-    Handles:
-    - sender → role mapping
-    - Content block extraction (text, thinking, tool_use, tool_result)
-    - Splits tool_results into separate user messages (API requirement)
-    - Preserves structured blocks (thinking, tool_use) for API compatibility
-    
-    By default includes everything for full continuity.
+    Convert socketteer export by calling bin/graft-import subprocess.
+    Returns (messages, name, model) tuple.
     """
-    messages = []
-    
-    for msg in data.get('chat_messages', []):
-        sender = msg.get('sender', '')
-        
-        # Map sender to API role
-        if sender == 'human':
-            role = 'user'
-        elif sender == 'assistant':
-            role = 'assistant'
-        else:
-            continue  # Skip unknown senders
-        
-        # Separate blocks by type - tool_results must go in user messages
-        assistant_blocks = []
-        tool_result_blocks = []
-        
-        for block in msg.get('content', []):
-            block_type = block.get('type', '')
-            
-            if block_type == 'text':
-                text = block.get('text', '')
-                if text:
-                    assistant_blocks.append({'type': 'text', 'text': text})
-            
-            elif block_type == 'thinking':
-                if include_thinking:
-                    thinking = block.get('thinking', '')
-                    if thinking:
-                        thinking_block = {'type': 'thinking', 'thinking': thinking}
-                        if block.get('signature'):
-                            thinking_block['signature'] = block['signature']
-                        assistant_blocks.append(thinking_block)
-            
-            elif block_type == 'tool_use':
-                if include_tool_use:
-                    assistant_blocks.append({
-                        'type': 'tool_use',
-                        'id': block.get('id', ''),
-                        'name': block.get('name', 'unknown'),
-                        'input': block.get('input', {})
-                    })
-            
-            elif block_type == 'tool_result':
-                if include_tool_use:
-                    # Sanitize content - API rejects extra fields like 'uuid'
-                    raw_content = block.get('content', '')
-                    if isinstance(raw_content, list):
-                        sanitized = []
-                        for item in raw_content:
-                            if isinstance(item, dict) and item.get('type') == 'text':
-                                sanitized.append({'type': 'text', 'text': item.get('text', '')})
-                            else:
-                                sanitized.append(str(item) if not isinstance(item, str) else item)
-                        tool_content = sanitized if sanitized else ''
-                    else:
-                        tool_content = raw_content
-                    tool_result_blocks.append({
-                        'type': 'tool_result',
-                        'tool_use_id': block.get('tool_use_id', ''),
-                        'content': tool_content
-                    })
-        
-        # Helper to simplify content
-        def simplify_content(blocks):
-            if not blocks:
-                return None
-            has_structured = any(b.get('type') in ('thinking', 'tool_use', 'tool_result') for b in blocks)
-            if has_structured:
-                return blocks
-            text_parts = [b['text'] for b in blocks if b.get('type') == 'text']
-            return '\n\n'.join(text_parts) if text_parts else None
-        
-        # Add assistant content (for assistant messages) or user content (for user messages)
-        if role == 'assistant':
-            content = simplify_content(assistant_blocks)
-            if content:
-                messages.append({'role': 'assistant', 'content': content})
-            
-            # Tool results go in a separate user message
-            if tool_result_blocks:
-                messages.append({'role': 'user', 'content': tool_result_blocks})
-        
-        elif role == 'user':
-            content = simplify_content(assistant_blocks)  # User messages only have text
-            if content:
-                # Merge with previous user message if possible
-                if (messages and messages[-1]['role'] == 'user' and 
-                    isinstance(messages[-1]['content'], str) and isinstance(content, str)):
-                    messages[-1]['content'] = f"{messages[-1]['content']}\n\n{content}"
-                else:
-                    messages.append({'role': 'user', 'content': content})
-    
-    return messages
+    import subprocess
+
+    # Find graft-import relative to this file
+    bin_dir = Path(__file__).resolve().parent / 'bin' / 'graft-import'
+    if not bin_dir.exists():
+        raise FileNotFoundError(f"graft-import not found at {bin_dir}")
+
+    cmd = [sys.executable, str(bin_dir), str(path)]
+    if not include_thinking:
+        cmd.append('--no-thinking')
+    if not include_tool_use:
+        cmd.append('--no-tool-use')
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"graft-import failed: {result.stderr.strip()}")
+
+    # Print graft-import's stderr (progress/warnings) to our stderr
+    if result.stderr:
+        print(result.stderr.strip(), file=sys.stderr)
+
+    data = json.loads(result.stdout)
+    return data['messages'], data.get('name', 'imported'), data.get('model')
 
 
 class Conversation:
@@ -323,10 +245,10 @@ class Conversation:
         
         # Detect format and convert
         if isinstance(data, dict) and 'chat_messages' in data:
-            # Socketteer format - needs conversion
-            messages = convert_socketteer_format(data, include_thinking, include_tool_use)
-            default_name = data.get('name', 'imported')
-            source_model = data.get('model')
+            # Socketteer format - delegate to bin/graft-import
+            messages, default_name, source_model = convert_socketteer_via_import(
+                path, include_thinking, include_tool_use
+            )
         elif isinstance(data, dict) and 'messages' in data:
             # Already API format (from json_to_api.py or graft save)
             messages = data['messages']
