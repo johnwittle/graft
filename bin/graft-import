@@ -14,14 +14,18 @@ from pathlib import Path
 
 
 def sanitize_tool_result_content(raw_content):
-    """Sanitize tool_result content — strip extra fields like uuid from text items."""
+    """Sanitize tool_result content — normalize all items to API-compatible text blocks."""
     if isinstance(raw_content, list):
         sanitized = []
         for item in raw_content:
-            if isinstance(item, dict) and item.get('type') == 'text':
-                sanitized.append({'type': 'text', 'text': item.get('text', '')})
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 sanitized.append(item)
+            elif isinstance(item, dict):
+                # Extract text from any dict type (text, knowledge, etc.)
+                # and emit a clean text block — the API only accepts {"type": "text"}
+                text = item.get('text', '')
+                if text:
+                    sanitized.append({'type': 'text', 'text': text})
             else:
                 sanitized.append(str(item))
         return sanitized if sanitized else ''
