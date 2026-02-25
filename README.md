@@ -84,7 +84,7 @@ The `bin/` directory contains utilities for integrating with Claude Code while p
 
 ### claude-sub
 
-A wrapper for Claude Code that automatically archives sessions:
+A wrapper for Claude Code that automatically archives sessions, created so that Claude can easily run Claude Code from within graft using shell_exec:
 
 ```bash
 claude-sub "task description" "prompt for claude code"
