@@ -87,7 +87,7 @@ The `bin/` directory contains utilities for integrating with Claude Code while p
 A wrapper for Claude Code that automatically archives sessions:
 
 ```bash
-claude-sub "fix the login bug" --dangerously-skip-permissions
+claude-sub "task description" "prompt for claude code"
 ```
 
 Sessions are archived to `~/.claude-archive/` with timestamps and task descriptions.
