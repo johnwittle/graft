@@ -616,6 +616,7 @@ class ToolExecutor:
     
     def __init__(self, project_root):
         self.project_root = Path(project_root).resolve()
+        self.consecutive_shell_calls = 0  # For escalating sleep
     
     def _safe_path(self, path_str):
         """
@@ -697,6 +698,18 @@ class ToolExecutor:
     def _shell_exec(self, command):
         """Execute shell command in project root."""
         import subprocess
+        import time
+        
+        # Escalating sleep for consecutive shell calls (prevents polling loops)
+        # Sleep happens BEFORE command so timeout still applies to actual command
+        self.consecutive_shell_calls += 1
+        if self.consecutive_shell_calls == 2:
+            time.sleep(2)
+        elif self.consecutive_shell_calls == 3:
+            time.sleep(5)
+        elif self.consecutive_shell_calls >= 4:
+            time.sleep(10)
+        
         try:
             result = subprocess.run(
                 command,
@@ -1483,6 +1496,9 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         self.conversation.unsaved_changes = True
         
         total_tool_calls = 0
+        # Reset consecutive shell call counter for escalating sleep
+        if self.tool_executor:
+            self.tool_executor.consecutive_shell_calls = 0
         turn_input_tokens = 0
         turn_output_tokens = 0
         turn_cache_creation = 0
