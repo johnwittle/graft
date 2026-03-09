@@ -765,7 +765,7 @@ class GraftSession:
             'tool_calls': 0,
             'last_input_tokens': 0,  # Most recent API-reported context size
         }
-        self.recent_tool_calls = []  # Timestamps for rate limiting warnings
+        # (removed: recent_tool_calls tracking - escalating sleep handles this now)
     
     def init_client(self):
         """Initialize Anthropic client."""
@@ -1426,18 +1426,6 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         
         return tools if tools else None
     
-    def _check_tool_rate(self):
-        """Check tool call rate and return a warning message if excessive."""
-        import time
-        now = time.time()
-        # Clean out calls older than 60 seconds
-        self.recent_tool_calls = [t for t in self.recent_tool_calls if now - t < 60]
-        self.recent_tool_calls.append(now)
-        
-        if len(self.recent_tool_calls) >= 10:
-            return f"\n\n[Note: {len(self.recent_tool_calls)} tool calls in the last 60 seconds. For bulk operations or complex tasks, consider `claude-sub --async 'description' 'prompt'` to delegate to Claude Code (uses Max plan instead of API credits). Or add sleep between polling checks.]"
-        return ""
-
     def _update_stats(self, usage):
         """Update stats from a response's usage info."""
         self.stats['total_input_tokens'] += usage.input_tokens
@@ -1622,7 +1610,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                     
                     
                     # Check for excessive tool call rate
-                    result += self._check_tool_rate()
+                    # (removed: rate warning - escalating sleep handles this now)
                     # Show abbreviated result
                     result_preview = result[:100] + "..." if len(result) > 100 else result
                     print(f"[Result: {result_preview}]", flush=True)
