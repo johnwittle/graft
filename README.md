@@ -9,6 +9,7 @@ A conversation harness for the Anthropic API, designed for context continuity an
 - **Prompt caching**: Configurable TTL (5m/1h) to reduce costs on long conversations
 - **Web search**: Optional integration with Anthropic's web search tool
 - **Readable transcripts**: View conversation history in a pager, export to text files
+- **Shell Execution**: `/shell on` allows Claude to execute shell commands in the environment, with Claude Code integration through `claude-sub` (enable at your own risk!)
 
 ## Installation
 ```bash
@@ -84,7 +85,7 @@ The `bin/` directory contains utilities for integrating with Claude Code while p
 
 ### claude-sub
 
-A wrapper for Claude Code that automatically archives sessions:
+A wrapper for Claude Code that automatically archives sessions, created so that Claude can easily run Claude Code from within graft using shell_exec:
 
 ```bash
 claude-sub "task description" "prompt for claude code"
