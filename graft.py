@@ -81,21 +81,26 @@ def load_config():
         try:
             import tomllib
         except ImportError:
-            # Python < 3.11 fallback - simple TOML parsing
-            for line in CONFIG_PATH.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip().strip('"\'')
-                    if key in config:
-                        config[key] = value
-            return config
-        
+            try:
+                import tomli as tomllib
+            except ImportError:
+                # Last-resort fallback: only handles simple single-line key=value.
+                # Does not understand triple-quoted strings, booleans, arrays, etc.
+                # Install `tomli` (pip install tomli) to get full TOML support on Python < 3.11.
+                for line in CONFIG_PATH.read_text().splitlines():
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip().strip('"\'')
+                        if key in config:
+                            config[key] = value
+                return config
+
         with open(CONFIG_PATH, 'rb') as f:
             file_config = tomllib.load(f)
             config.update(file_config)
-    
+
     return config
 
 def save_default_config():
