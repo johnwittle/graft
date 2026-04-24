@@ -63,6 +63,7 @@ DEFAULT_CONFIG = {
     "max_tokens": 8192,
     "thinking_budget": 0,  # 0 = disabled, >1024 = enabled
     "web_search": False,
+    "default_system_prompt": "",
 }
 
 # === Setup Functions ===
@@ -120,6 +121,11 @@ thinking_budget = 0
 # Enable web search by default: true or false
 # Costs $10 per 1,000 searches. Must be enabled in Anthropic Console.
 web_search = false
+
+# System prompt applied to new conversations. Use triple-quoted strings for
+# multi-line prompts. Loaded conversations keep whatever prompt they were
+# saved with; this only affects /new. Override in a conversation with /system.
+default_system_prompt = ""
 '''
         CONFIG_PATH.write_text(config_text)
 
@@ -785,8 +791,13 @@ class GraftSession:
         
         self.conversation = Conversation()
         self.conversation.model = self.config.get('default_model')
+        default_prompt = self.config.get('default_system_prompt', "")
+        if default_prompt:
+            self.conversation.system_prompt = default_prompt
         self.stats = {k: 0 for k in self.stats}
         print("Started new conversation.")
+        if default_prompt:
+            print(f"Applied default system prompt ({len(default_prompt)} chars)")
         return True
     
     def load_conversation(self, name):
