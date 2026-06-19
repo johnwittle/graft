@@ -380,7 +380,9 @@ def format_message(msg, include_tools=False, include_thinking=False):
         text_parts = []
         for block in content:
             if isinstance(block, dict):
-                if 'text' in block:
+                if block.get('type') == 'image':
+                    text_parts.append("[image]")
+                elif 'text' in block:
                     text_parts.append(block['text'])
                 elif include_thinking and block.get('type') == 'thinking':
                     thinking_content = block.get('thinking', '')
@@ -524,7 +526,7 @@ def prepare_messages_for_cache(messages, cache_ttl="5m"):
             return True
         if isinstance(content, list):
             return any(
-                isinstance(block, dict) and block.get('type') == 'text'
+                isinstance(block, dict) and block.get('type') in ('text', 'image')
                 for block in content
             )
         return False
@@ -622,12 +624,97 @@ SHELL_TOOL = {
 }
 
 
+# === Image support (native Anthropic image content blocks) ===
+
+IMAGE_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+
+def native_image_cap(model):
+    """Long-edge pixel cap for a model's vision. High-res models go to 2576."""
+    m = (model or "").lower()
+    if any(t in m for t in ("opus-4-7", "opus-4-8", "opus-4.7", "opus-4.8",
+                            "fable", "mythos")):
+        return 2576
+    return 1568
+
+def encode_image_block(path, model=None, crop=None):
+    """Read an image and return (image_content_block, info_str).
+
+    Optionally crop to (left, top, right, bottom) in pixels and downscale so the
+    long edge fits the model's native cap. Resizing/cropping needs Pillow; without
+    it the image is sent as-is (the API will resize server-side), and cropping
+    raises a clear error.
+    """
+    import base64 as _b64
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise ValueError(f"image not found: {path}")
+    media_type = IMAGE_MEDIA_TYPES.get(p.suffix.lower())
+    if not media_type:
+        raise ValueError(f"unsupported image type '{p.suffix}' (use jpg/png/gif/webp)")
+
+    data_bytes = p.read_bytes()
+    dims = ""
+    try:
+        from PIL import Image, ImageOps
+        from io import BytesIO
+        im = ImageOps.exif_transpose(Image.open(p))
+        if crop:
+            im = im.crop(tuple(crop))
+        cap = native_image_cap(model)
+        if max(im.size) > cap:
+            scale = cap / max(im.size)
+            im = im.resize((max(1, round(im.width * scale)),
+                           max(1, round(im.height * scale))))
+        fmt = "PNG" if media_type == "image/png" else "JPEG"
+        if fmt == "JPEG" and im.mode in ("RGBA", "P"):
+            im = im.convert("RGB")
+        buf = BytesIO()
+        im.save(buf, format=fmt, quality=88)
+        data_bytes = buf.getvalue()
+        media_type = "image/png" if fmt == "PNG" else "image/jpeg"
+        dims = f", {im.width}x{im.height}"
+    except ImportError:
+        if crop:
+            raise ValueError("cropping requires Pillow (pip install pillow)")
+
+    b64 = _b64.standard_b64encode(data_bytes).decode("ascii")
+    block = {"type": "image",
+             "source": {"type": "base64", "media_type": media_type, "data": b64}}
+    return block, f"{p.name} ({len(b64) // 1024} KB base64{dims})"
+
+
+VIEW_IMAGE_TOOL = {
+    "name": "view_image",
+    "description": (
+        "Look at an image file in the project directory, optionally zooming into "
+        "a sub-region. Use this to examine an image closely or crop into a detail "
+        "you want at higher resolution. Returns the image so you can see it "
+        "directly. Wide photos are downscaled when sent; cropping to a region and "
+        "viewing it is how you see fine detail."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string",
+                     "description": "Image path, relative to the project directory."},
+            "region": {"type": "array", "items": {"type": "number"},
+                       "description": "Optional crop [left, top, right, bottom] in pixels of the full image."},
+        },
+        "required": ["path"],
+    },
+}
+
+
 class ToolExecutor:
     """Executes tools with sandboxing to a project root."""
     
     def __init__(self, project_root):
         self.project_root = Path(project_root).resolve()
         self.consecutive_shell_calls = 0  # For escalating sleep
+        self.model = None  # current model, set by session (image resize cap)
     
     def _safe_path(self, path_str):
         """
@@ -656,6 +743,8 @@ class ToolExecutor:
                 return self._write_file(tool_input["path"], tool_input["content"])
             elif tool_name == "shell_exec":
                 return self._shell_exec(tool_input["command"])
+            elif tool_name == "view_image":
+                return self._view_image(tool_input["path"], tool_input.get("region"))
             else:
                 return f"Error: Unknown tool '{tool_name}'"
         except ValueError as e:
@@ -705,6 +794,25 @@ class ToolExecutor:
         
         path.write_text(content, encoding='utf-8')
         return f"Successfully wrote {len(content)} bytes to {path_str}"
+
+    def _view_image(self, path_str, region=None):
+        """Return an image (optionally cropped) as tool_result content blocks."""
+        path = self._safe_path(path_str)
+        if not path.exists():
+            return f"Error: image '{path_str}' does not exist"
+        crop = None
+        if region:
+            try:
+                crop = tuple(int(round(float(x))) for x in region)
+                assert len(crop) == 4
+            except Exception:
+                return "Error: region must be [left, top, right, bottom] in pixels"
+        try:
+            block, info = encode_image_block(path, model=self.model, crop=crop)
+        except ValueError as e:
+            return f"Error: {e}"
+        note = f"Viewing {info}" + (f" cropped to {crop}" if crop else "")
+        return [block, {"type": "text", "text": note}]
 
     def _shell_exec(self, command):
         """Execute shell command in project root."""
@@ -766,6 +874,7 @@ class GraftSession:
         self.tools_enabled = False
         self.tool_executor = None  # Set when tools are enabled with a project root
         self.shell_enabled = False  # Separate from tools_enabled
+        self.pending_images = []  # image content blocks queued for next user message
         self.stats = {
             'cache_creation_input_tokens': 0,
             'cache_read_input_tokens': 0,
@@ -900,6 +1009,7 @@ Commands:
   /tools [path]   - Enable file tools for path (or show status)
   /tools off      - Disable file tools
   /shell on|off   - Enable/disable shell commands
+  /image <path> [l,t,r,b] - Attach an image (or cropped region) to next message
   /tokens         - Show token estimate
   /compress        - Compress conversation to reduce token count
   /system [text]  - Set/show system prompt
@@ -1215,6 +1325,38 @@ Commands:
                 if self.conversation: self.conversation.shell_enabled = False
 
         
+        elif cmd == '/image' or cmd == '/attach':
+            if not arg:
+                if self.pending_images:
+                    print(f"{len(self.pending_images)} image(s) queued for next message.")
+                else:
+                    print("Usage: /image <path> [left,top,right,bottom]")
+                    print("Queues an image to send with your next message.")
+                return True
+            if arg.strip().lower() in ('clear', 'none'):
+                self.pending_images = []
+                print("Cleared queued images.")
+                return True
+            a = arg.split()
+            crop = None
+            if len(a) > 1:
+                try:
+                    crop = tuple(int(round(float(x))) for x in a[1].split(','))
+                    assert len(crop) == 4
+                except Exception:
+                    print("Region must be left,top,right,bottom in pixels (no spaces).")
+                    return True
+            model = self.conversation.model if self.conversation else None
+            try:
+                block, info = encode_image_block(a[0], model=model, crop=crop)
+            except ValueError as e:
+                print(f"Error: {e}")
+                return True
+            self.pending_images.append(block)
+            print(f"Queued image: {info}. Sent with your next message "
+                  f"({len(self.pending_images)} queued).")
+            return True
+
         elif cmd == '/compress':
             self.handle_compress()
 
@@ -1435,6 +1577,7 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         # Add file tools if enabled
         if self.tools_enabled and self.tool_executor:
             tools.extend(FILE_TOOLS)
+            tools.append(VIEW_IMAGE_TOOL)
         
         # Add shell tool if enabled
         if self.shell_enabled and self.tool_executor:
@@ -1495,8 +1638,19 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         if not self.conversation:
             self.new_conversation()
         
-        # Add user message
-        self.conversation.messages.append({"role": "user", "content": user_input})
+        # Make the current model known to the tool executor (image resize cap)
+        if self.tool_executor:
+            self.tool_executor.model = self.conversation.model
+
+        # Add user message, prepending any images queued via /image (image-first)
+        if self.pending_images:
+            user_content = list(self.pending_images)
+            if user_input:
+                user_content.append({"type": "text", "text": user_input})
+            self.conversation.messages.append({"role": "user", "content": user_content})
+            self.pending_images = []
+        else:
+            self.conversation.messages.append({"role": "user", "content": user_input})
         self.conversation.unsaved_changes = True
         
         total_tool_calls = 0
@@ -1628,7 +1782,10 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                     # Check for excessive tool call rate
                     # (removed: rate warning - escalating sleep handles this now)
                     # Show abbreviated result
-                    result_preview = result[:100] + "..." if len(result) > 100 else result
+                    if isinstance(result, list):
+                        result_preview = "[image]"
+                    else:
+                        result_preview = result[:100] + "..." if len(result) > 100 else result
                     print(f"[Result: {result_preview}]", flush=True)
                     
                     tool_results.append({
