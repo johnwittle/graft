@@ -30,7 +30,7 @@ Commands during conversation:
   /cache on|off|5m|1h  - Control prompt caching
   /model [name]   - Show or switch model
   /max_tokens [n] - Show or set max output tokens
-  /thinking [n]  - Enable extended thinking with token budget
+  /thinking [n|mode] [n]  - Extended thinking. See '/thinking' with no args for modes.
   /web on|off     - Toggle web search
   /tools [path]   - Enable file tools for a directory
   /tokens         - Show token estimates
@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "editing_mode": "emacs",
     "max_tokens": 8192,
     "thinking_budget": 0,  # 0 = disabled, >1024 = enabled
+    "thinking_mode": "auto",  # 'auto' | 'adaptive' | 'enabled' | 'off' - see /thinking
     "web_search": False,
     "default_system_prompt": "",
 }
@@ -122,6 +123,11 @@ max_tokens = 8192
 
 # Extended thinking budget (0 = disabled, minimum 1024 when enabled)
 thinking_budget = 0
+
+# Extended thinking mode: "auto" (recommended - picks adaptive vs a literal
+# token budget per the active model), "adaptive", "enabled" (force a literal
+# budget where the model still allows it), or "off". See /thinking.
+thinking_mode = "auto"
 
 # Enable web search by default: true or false
 # Costs $10 per 1,000 searches. Must be enabled in Anthropic Console.
@@ -216,6 +222,7 @@ class Conversation:
         self.tools_path = None  # Path string if tools enabled
         self.shell_enabled = False
         self.thinking_budget = 0  # 0 = disabled
+        self.thinking_mode = "auto"  # 'auto' | 'adaptive' | 'enabled' | 'off'
     
     @classmethod
     def load(cls, name):
@@ -238,7 +245,8 @@ class Conversation:
         conv.tools_path = data.get("tools_path", None)
         conv.shell_enabled = data.get("shell_enabled", False)
         conv.thinking_budget = data.get("thinking_budget", 0)
-        
+        conv.thinking_mode = data.get("thinking_mode", "auto")
+
         return conv
     
     @classmethod
@@ -302,6 +310,7 @@ class Conversation:
             'tools_path': self.tools_path,
             'shell_enabled': self.shell_enabled,
             'thinking_budget': self.thinking_budget,
+            'thinking_mode': self.thinking_mode,
         }
         
         # Sanitize name to prevent path traversal
@@ -639,6 +648,102 @@ def native_image_cap(model):
         return 2576
     return 1568
 
+
+# === Extended thinking: adaptive vs legacy budget_tokens models ===
+
+def model_thinking_style(model):
+    """How a model expects the `thinking` request param to be shaped.
+
+    'always_on'     - thinking cannot be turned off (Fable/Mythos); adaptive only.
+    'adaptive_only' - adaptive thinking only; `budget_tokens` is rejected (400).
+    'dual'          - supports BOTH: adaptive (recommended) and the deprecated-but-
+                      functional `{"type": "enabled", "budget_tokens": N}` escape hatch
+                      (Opus 4.6, Sonnet 4.6).
+    'legacy'        - pre-4.6 models: only the `enabled` + `budget_tokens` shape exists;
+                      adaptive isn't available at all.
+    """
+    m = (model or "").lower()
+    if any(t in m for t in ("fable", "mythos")):
+        return "always_on"
+    if any(t in m for t in ("opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6")):
+        return "dual"
+    if any(t in m for t in ("opus-4-7", "opus-4-8", "opus-4.7", "opus-4.8", "sonnet-5")):
+        return "adaptive_only"
+    return "legacy"
+
+
+def resolve_thinking_request(model, thinking_mode, thinking_budget):
+    """Build the `thinking` request kwarg for a model + the user's /thinking setting.
+
+    thinking_mode is one of 'off', 'auto', 'adaptive', 'enabled' (see the /thinking
+    command). Returns (thinking_dict_or_None, note_or_None). `note` is a human-readable
+    explanation whenever the model can't honor the user's literal choice (e.g. a token
+    budget on an adaptive-only model, an explicit 'enabled' request on a model that
+    rejects budget_tokens, or disabling thinking on an always-on model) so the override
+    can be surfaced to the user.
+    """
+    style = model_thinking_style(model)
+    supports_adaptive = style in ("dual", "adaptive_only", "always_on")
+    supports_enabled = style in ("legacy", "dual")
+
+    # A budget-driven mode ('auto'/'enabled') with no budget configured means thinking
+    # is simply off (this is the default state before /thinking is ever touched) —
+    # except on always-on models, which think regardless of what's configured.
+    off = thinking_mode == "off" or (
+        thinking_mode in ("auto", "enabled") and thinking_budget < 1024
+    )
+    if off:
+        if style == "always_on":
+            return {"type": "adaptive"}, (
+                f"[Note: {model} always thinks — 'thinking off' can't be honored here; "
+                f"running with adaptive thinking anyway.]"
+            )
+        return None, None
+
+    # From here on the user wants thinking on. Resolve 'auto' to a concrete mode,
+    # preferring adaptive wherever it's offered (it's the recommended setting
+    # everywhere it's available, including on 'dual' models).
+    wanted_mode = thinking_mode
+    if wanted_mode == "auto":
+        wanted_mode = "adaptive" if supports_adaptive else "enabled"
+
+    if wanted_mode == "adaptive":
+        if supports_adaptive:
+            note = None
+            if thinking_budget >= 1024:
+                if style == "dual":
+                    note = (
+                        f"[Note: {model} defaults to adaptive thinking (recommended) — "
+                        f"ignoring your {thinking_budget:,}-token budget. Use "
+                        f"'/thinking enabled {thinking_budget}' to force the literal budget.]"
+                    )
+                elif thinking_mode != "adaptive":
+                    note = (
+                        f"[Note: {model} only supports adaptive thinking (no token budget) — "
+                        f"using thinking: adaptive instead of your {thinking_budget:,}-token budget.]"
+                    )
+            return {"type": "adaptive"}, note
+        # Plain legacy model — adaptive isn't available at all; fall back to a budget.
+        if thinking_budget >= 1024:
+            return {"type": "enabled", "budget_tokens": thinking_budget}, (
+                f"[Note: {model} doesn't support adaptive thinking — using an explicit "
+                f"{thinking_budget:,}-token budget instead.]"
+            )
+        return None, (
+            f"[Note: {model} doesn't support adaptive thinking, and no token budget is "
+            f"set — thinking left off. Use '/thinking enabled <n>' for this model.]"
+        )
+
+    # wanted_mode == "enabled"
+    if supports_enabled:
+        return {"type": "enabled", "budget_tokens": thinking_budget}, None
+    # Model rejects budget_tokens outright (400) — fall back to adaptive.
+    return {"type": "adaptive"}, (
+        f"[Note: {model} doesn't support an explicit token budget (budget_tokens is "
+        f"rejected) — using thinking: adaptive instead of your {thinking_budget:,}-token "
+        f"budget.]"
+    )
+
 def encode_image_block(path, model=None, crop=None):
     """Read an image and return (image_content_block, info_str).
 
@@ -939,16 +1044,23 @@ class GraftSession:
                 self.tools_enabled = False
             self.shell_enabled = self.conversation.shell_enabled
             self.config["thinking_budget"] = self.conversation.thinking_budget
-            
+            self.config["thinking_mode"] = self.conversation.thinking_mode
+
+            thinking_kwargs, thinking_note = resolve_thinking_request(
+                self.conversation.model, self.conversation.thinking_mode, self.conversation.thinking_budget
+            )
+
             # Show tool status if any are enabled
             tools_status = []
             if self.web_search_enabled: tools_status.append("web")
             if self.tools_enabled: tools_status.append(f"tools:{self.conversation.tools_path}")
             if self.shell_enabled: tools_status.append("shell")
-            if self.config.get("thinking_budget", 0) > 0:
-                tools_status.append(f"thinking:{self.config['thinking_budget']}")
+            if thinking_kwargs:
+                tools_status.append(f"thinking:{thinking_kwargs['type']}")
             if tools_status:
                 print("Restored settings: " + ", ".join(tools_status))
+            if thinking_note:
+                print(thinking_note)
             # Show recent context
             if self.conversation.messages:
                 show_recent_messages(self.conversation.messages, n=4)
@@ -1004,7 +1116,7 @@ Commands:
   /export [--tools] [--thinking] [file] - Export transcript
   /model [name]   - Show or switch model
   /max_tokens [n] - Show or set max output tokens
-  /thinking [n]  - Enable extended thinking with token budget
+  /thinking [n|mode] [n]  - Extended thinking. See '/thinking' with no args for modes.
   /web on|off     - Toggle web search
   /tools [path]   - Enable file tools for path (or show status)
   /tools off      - Disable file tools
@@ -1217,6 +1329,11 @@ Commands:
                 self.conversation.model = arg
                 self.conversation.unsaved_changes = True
             print(f"Model set to: {arg}")
+            _, thinking_note = resolve_thinking_request(
+                arg, self.config.get('thinking_mode', 'auto'), self.config.get('thinking_budget', 0)
+            )
+            if thinking_note:
+                print(thinking_note)
         
         elif cmd == '/max_tokens' or cmd == '/output':
             current = self.config.get('max_tokens', 8192)
@@ -1235,37 +1352,92 @@ Commands:
                 print(f"Invalid number: {arg}")
         
         elif cmd == '/thinking':
-            current = self.config.get('thinking_budget', 0)
+            current_budget = self.config.get('thinking_budget', 0)
+            current_mode = self.config.get('thinking_mode', 'auto')
+            active_model = self.conversation.model if self.conversation else self.config.get('default_model')
+
             if not arg:
-                if current > 0:
-                    print(f"Extended thinking: ON (budget: {current:,} tokens)")
-                else:
+                if current_mode == 'off':
                     print("Extended thinking: OFF")
-                print("Usage: /thinking <budget>  (e.g., /thinking 10000)")
-                print("       /thinking off       (disable thinking)")
-                print("Note: minimum budget is 1024 tokens")
+                else:
+                    budget_str = f", budget: {current_budget:,} tokens" if current_budget else ""
+                    print(f"Extended thinking: ON (mode: {current_mode}{budget_str})")
+                print("Usage: /thinking <n>            - enable; mode picked automatically for the model")
+                print("       /thinking adaptive        - force adaptive thinking (no budget needed)")
+                print("       /thinking enabled <n>      - force a literal token budget (older/dual models)")
+                print("       /thinking auto [<n>]       - let graft pick the mode automatically (default)")
+                print("       /thinking off              - disable")
+                _, note = resolve_thinking_request(active_model, current_mode, current_budget)
+                if note:
+                    print(note)
                 return True
-            if arg.lower() == 'off':
-                self.config['thinking_budget'] = 0
+
+            # Order-independent parsing: each token is either a mode keyword or a number.
+            mode = None
+            budget = None
+            for tok in arg.split():
+                low = tok.lower()
+                if low in ('off', 'auto', 'adaptive', 'enabled'):
+                    if mode is not None:
+                        print(f"Only one mode may be given (got '{mode}' and '{low}')")
+                        return True
+                    mode = low
+                else:
+                    try:
+                        budget = int(tok)
+                    except ValueError:
+                        print(f"Unrecognized /thinking argument: {tok}")
+                        return True
+
+            if mode is None:
+                mode = 'auto'  # bare "/thinking <n>" behaves as before
+
+            if mode == 'off':
+                if budget is not None:
+                    print("'/thinking off' doesn't take a budget")
+                    return True
+                self.config['thinking_mode'] = 'off'
                 if self.conversation:
-                    self.conversation.thinking_budget = 0
+                    self.conversation.thinking_mode = 'off'
+                    self.conversation.unsaved_changes = True
                 print("Extended thinking disabled")
+                _, note = resolve_thinking_request(active_model, 'off', current_budget)
+                if note:
+                    print(note)
                 return True
-            try:
-                new_val = int(arg)
-                if new_val < 1024:
+
+            if mode == 'enabled' and budget is None:
+                print("Usage: /thinking enabled <budget>  (e.g., /thinking enabled 10000)")
+                return True
+
+            if budget is None:
+                budget = current_budget  # e.g. bare "/thinking adaptive" reuses the last budget
+
+            if mode != 'adaptive':
+                if budget < 1024:
                     print("Thinking budget must be at least 1024 tokens")
                     return True
-                if new_val > 128000:
+                if budget > 128000:
                     print("Thinking budget must be at most 128000 tokens")
                     return True
-                self.config['thinking_budget'] = new_val
-                if self.conversation:
-                    self.conversation.thinking_budget = new_val
-                    self.conversation.unsaved_changes = True
-                print(f"Extended thinking enabled with budget: {new_val:,} tokens")
-            except ValueError:
-                print(f"Invalid number: {arg}")
+
+            self.config['thinking_mode'] = mode
+            self.config['thinking_budget'] = budget
+            if self.conversation:
+                self.conversation.thinking_mode = mode
+                self.conversation.thinking_budget = budget
+                self.conversation.unsaved_changes = True
+
+            if mode == 'adaptive':
+                print("Extended thinking enabled (adaptive)")
+            elif mode == 'enabled':
+                print(f"Extended thinking enabled with an explicit token budget: {budget:,} tokens")
+            else:
+                print(f"Extended thinking enabled with budget: {budget:,} tokens")
+
+            _, note = resolve_thinking_request(active_model, mode, budget)
+            if note:
+                print(note)
         
         elif cmd == '/tokens':
             if not self.conversation:
@@ -1664,8 +1836,17 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         
         rollback_point = len(self.conversation.messages) - 1  # Before user message we just added
         try:
+            # Resolve once per turn: model + thinking settings don't change mid-turn,
+            # so don't re-derive (and re-print the note) on every tool-use round trip.
+            thinking_kwargs, thinking_note = resolve_thinking_request(
+                self.conversation.model,
+                self.config.get('thinking_mode', 'auto'),
+                self.config.get('thinking_budget', 0),
+            )
+            if thinking_note:
+                print(f"\n{thinking_note}")
             print("\nClaude: ", end="", flush=True)
-            
+
             while True:
                 # Prepare messages with cache control
                 prepared = prepare_messages_for_cache(
@@ -1687,13 +1868,9 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 if tools:
                     request_kwargs["tools"] = tools
                 
-                # Add extended thinking if enabled
-                thinking_budget = self.config.get('thinking_budget', 0)
-                if thinking_budget >= 1024:
-                    request_kwargs["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": thinking_budget
-                    }
+                # Add extended thinking if enabled (resolved once above, before the loop)
+                if thinking_kwargs:
+                    request_kwargs["thinking"] = thinking_kwargs
                 
                 # Make streaming API call
                 with self.client.messages.stream(**request_kwargs) as stream:
