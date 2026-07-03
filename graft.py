@@ -694,7 +694,7 @@ def resolve_thinking_request(model, thinking_mode, thinking_budget):
     )
     if off:
         if style == "always_on":
-            return {"type": "adaptive"}, (
+            return {"type": "adaptive", "display": "summarized"}, (
                 f"[Note: {model} always thinks — 'thinking off' can't be honored here; "
                 f"running with adaptive thinking anyway.]"
             )
@@ -722,7 +722,7 @@ def resolve_thinking_request(model, thinking_mode, thinking_budget):
                         f"[Note: {model} only supports adaptive thinking (no token budget) — "
                         f"using thinking: adaptive instead of your {thinking_budget:,}-token budget.]"
                     )
-            return {"type": "adaptive"}, note
+            return {"type": "adaptive", "display": "summarized"}, note
         # Plain legacy model — adaptive isn't available at all; fall back to a budget.
         if thinking_budget >= 1024:
             return {"type": "enabled", "budget_tokens": thinking_budget}, (
@@ -738,7 +738,7 @@ def resolve_thinking_request(model, thinking_mode, thinking_budget):
     if supports_enabled:
         return {"type": "enabled", "budget_tokens": thinking_budget}, None
     # Model rejects budget_tokens outright (400) — fall back to adaptive.
-    return {"type": "adaptive"}, (
+    return {"type": "adaptive", "display": "summarized"}, (
         f"[Note: {model} doesn't support an explicit token budget (budget_tokens is "
         f"rejected) — using thinking: adaptive instead of your {thinking_budget:,}-token "
         f"budget.]"
@@ -1805,11 +1805,120 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
                 })
         return serialized
     
+    def _prompt_refusal_recovery(self, response, user_content, response_text='', thinking_text=''):
+        """Ask how to proceed after a stop_reason == 'refusal' response.
+
+        A refusal is a normal (HTTP 200) response, not an exception — the model's
+        safety classifiers declined the request, possibly after streaming partial
+        output. `response_text`/`thinking_text` are whatever this attempt streamed
+        before the decline, used only to tell a pre-generation ("input classifier")
+        refusal apart from a mid-generation ("output classifier") one — the API
+        itself doesn't label which kind occurred, so we infer it locally from
+        whether anything was actually generated first.
+
+        Returns one of:
+          ('edit', new_content)  - discard the failed turn; retry with new_content
+          ('continue', None)     - keep the partial response as this turn's final answer
+          ('fallback', None)     - discard the failed turn; retry on claude-opus-4-8
+          ('cancel', None)       - discard the failed turn entirely
+        """
+        details = getattr(response, 'stop_details', None)
+        category = getattr(details, 'category', None) if details else None
+        explanation = getattr(details, 'explanation', None) if details else None
+        recommended_model = getattr(details, 'recommended_model', None) if details else None
+
+        text_generated = bool(response_text)
+        thinking_generated = bool(thinking_text)
+        if not text_generated and not thinking_generated:
+            timing = ("BEFORE any generation started — the classic 'input' classifier "
+                      "refusal (the request itself was declined)")
+        elif not text_generated:
+            timing = ("AFTER the model began thinking but BEFORE any visible response "
+                      "text — mid-generation, cut off during the reasoning phase")
+        else:
+            timing = ("AFTER partial response text had already streamed — the newer "
+                      "mid-generation ('output') classifier behavior")
+
+        usage = getattr(response, 'usage', None)
+        input_tokens = getattr(usage, 'input_tokens', None) if usage else None
+        output_tokens = getattr(usage, 'output_tokens', None) if usage else None
+
+        print("\n\n[Declined by safety classifiers.]")
+        print(f"  served by model: {getattr(response, 'model', None) or self.conversation.model}")
+        print(f"  timing: {timing}")
+        print(f"  category: {category if category is not None else '(none — unmapped to a named category)'}")
+        print(f"  explanation: {explanation if explanation is not None else '(none provided)'}")
+        if recommended_model:
+            print(f"  recommended_model: {recommended_model}")
+        if input_tokens is not None or output_tokens is not None:
+            print(f"  usage: input_tokens={input_tokens}, output_tokens={output_tokens}")
+        if response_text:
+            preview = response_text if len(response_text) <= 200 else response_text[:200] + "…"
+            print(f"  partial response text ({len(response_text)} chars): {preview!r}")
+        if thinking_text:
+            print(f"  partial thinking text: {len(thinking_text)} chars")
+
+        while True:
+            print("What would you like to do?")
+            print("  1) Edit your message and try again")
+            print("  2) Keep the partial response above as the final answer for this turn")
+            print("  3) Retry this turn on claude-opus-4-8")
+            print("  4) Cancel (discard this message)")
+            choice = input("> ").strip()
+
+            if choice == '1':
+                # Show the original text rather than trying to pre-fill the input
+                # buffer via readline.insert_text()/startup_hook: that mechanism is
+                # known to double-insert under some terminals (e.g. tmux resize/
+                # reinit signals can re-fire the startup hook), which previously sent
+                # duplicated text to the API. The original line is already in
+                # readline's history from when it was typed in the main REPL loop,
+                # so pressing Up retrieves it for in-place editing with no custom hook.
+                if isinstance(user_content, list):
+                    original_text = next(
+                        (b.get('text', '') for b in user_content
+                         if isinstance(b, dict) and b.get('type') == 'text'),
+                        ""
+                    )
+                    image_note = " (any attached images will be kept)"
+                else:
+                    original_text = user_content or ""
+                    image_note = ""
+                if original_text:
+                    print(f"  Original message{image_note}: {original_text!r}")
+                else:
+                    print(f"  Original message had no text{image_note}.")
+                print("  (Press the Up arrow to recall it from history if you want to edit it in place.)")
+                new_text = input("[edit] You: ").strip()
+
+                if isinstance(user_content, list):
+                    kept = [b for b in user_content
+                            if not (isinstance(b, dict) and b.get('type') == 'text')]
+                    new_content = kept + ([{"type": "text", "text": new_text}] if new_text else [])
+                    if not new_content:
+                        print("Nothing to send; choose again.")
+                        continue
+                else:
+                    if not new_text:
+                        print("No text entered; choose again.")
+                        continue
+                    new_content = new_text
+                return ('edit', new_content)
+
+            elif choice == '2':
+                return ('continue', None)
+            elif choice == '3':
+                return ('fallback', None)
+            elif choice == '4':
+                return ('cancel', None)
+            else:
+                print("Please enter 1, 2, 3, or 4.")
+
     def send_message(self, user_input):
         """Send a message and get response with streaming."""
         if not self.conversation:
             self.new_conversation()
-        
+
         # Make the current model known to the tool executor (image resize cap)
         if self.tool_executor:
             self.tool_executor.model = self.conversation.model
@@ -1819,12 +1928,12 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
             user_content = list(self.pending_images)
             if user_input:
                 user_content.append({"type": "text", "text": user_input})
-            self.conversation.messages.append({"role": "user", "content": user_content})
             self.pending_images = []
         else:
-            self.conversation.messages.append({"role": "user", "content": user_input})
+            user_content = user_input
+        self.conversation.messages.append({"role": "user", "content": user_content})
         self.conversation.unsaved_changes = True
-        
+
         total_tool_calls = 0
         # Reset consecutive shell call counter for escalating sleep
         if self.tool_executor:
@@ -1833,176 +1942,227 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
         turn_output_tokens = 0
         turn_cache_creation = 0
         turn_cache_read = 0
-        
+
         rollback_point = len(self.conversation.messages) - 1  # Before user message we just added
         try:
-            # Resolve once per turn: model + thinking settings don't change mid-turn,
-            # so don't re-derive (and re-print the note) on every tool-use round trip.
-            thinking_kwargs, thinking_note = resolve_thinking_request(
-                self.conversation.model,
-                self.config.get('thinking_mode', 'auto'),
-                self.config.get('thinking_budget', 0),
-            )
-            if thinking_note:
-                print(f"\n{thinking_note}")
-            print("\nClaude: ", end="", flush=True)
-
+            # Outer retry loop: normally runs once. Re-entered only after a
+            # stop_reason == "refusal" response, if the user chooses to edit
+            # their message or fall back to another model.
             while True:
-                # Prepare messages with cache control
-                prepared = prepare_messages_for_cache(
-                    self.conversation.messages, 
-                    self.cache_ttl
+                # Resolve per attempt: the model can change between attempts
+                # (e.g. a fallback retry on claude-opus-4-8).
+                thinking_kwargs, thinking_note = resolve_thinking_request(
+                    self.conversation.model,
+                    self.config.get('thinking_mode', 'auto'),
+                    self.config.get('thinking_budget', 0),
                 )
-                
-                # Build request
-                request_kwargs = {
-                    "model": self.conversation.model,
-                    "max_tokens": int(self.config.get('max_tokens', 8192)),
-                    "messages": prepared,
-                }
-                if self.conversation.system_prompt:
-                    request_kwargs["system"] = self.conversation.system_prompt
-                
-                # Add tools if any are enabled
-                tools = self._build_tools_list()
-                if tools:
-                    request_kwargs["tools"] = tools
-                
-                # Add extended thinking if enabled (resolved once above, before the loop)
-                if thinking_kwargs:
-                    request_kwargs["thinking"] = thinking_kwargs
-                
-                # Make streaming API call
-                with self.client.messages.stream(**request_kwargs) as stream:
-                    response_text = ""
-                    thinking_text = ""
-                    in_thinking = False
-                    
-                    # Stream events to handle both thinking and text
-                    for event in stream:
-                        if hasattr(event, 'type'):
-                            if event.type == 'content_block_start':
-                                block = getattr(event, 'content_block', None)
-                                if block and getattr(block, 'type', None) == 'thinking':
-                                    in_thinking = True
-                                    print("[Thinking...] ", end="", flush=True)
-                                elif block and getattr(block, 'type', None) == 'text':
-                                    in_thinking = False
-                            elif event.type == 'content_block_delta':
-                                delta = getattr(event, 'delta', None)
-                                if delta:
-                                    if getattr(delta, 'type', None) == 'thinking_delta':
-                                        thinking_text += getattr(delta, 'thinking', '')
-                                    elif getattr(delta, 'type', None) == 'text_delta':
-                                        text = getattr(delta, 'text', '')
-                                        print(text, end="", flush=True)
-                                        response_text += text
-                            elif event.type == 'content_block_stop':
-                                if in_thinking:
-                                    print(f"[{len(thinking_text)} chars]", flush=True)
-                                    print("Claude: ", end="", flush=True)
-                                    in_thinking = False
-                    
-                    # Get the final message for metadata
-                    response = stream.get_final_message()
-                
-                self.stats['requests'] += 1
-                
-                # Update stats
-                if hasattr(response, 'usage'):
-                    self._update_stats(response.usage)
-                    # Track per-turn totals for display
-                    turn_input_tokens += response.usage.input_tokens
-                    turn_output_tokens += response.usage.output_tokens
-                    turn_cache_creation += getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
-                    turn_cache_read += getattr(response.usage, 'cache_read_input_tokens', 0) or 0
-                
-                # Check for tool use
-                tool_uses = []
-                for block in response.content:
-                    if hasattr(block, 'type') and block.type == 'tool_use':
-                        tool_uses.append(block)
-                
-                # If no tool use, we're done
-                if response.stop_reason != "tool_use" or not tool_uses:
-                    # Save assistant response to history
-                    # Always use _serialize_content to preserve thinking blocks
+                if thinking_note:
+                    print(f"\n{thinking_note}")
+                print("\nClaude: ", end="", flush=True)
+
+                refused = False
+                while True:
+                    # Prepare messages with cache control
+                    prepared = prepare_messages_for_cache(
+                        self.conversation.messages,
+                        self.cache_ttl
+                    )
+
+                    # Build request
+                    request_kwargs = {
+                        "model": self.conversation.model,
+                        "max_tokens": int(self.config.get('max_tokens', 8192)),
+                        "messages": prepared,
+                    }
+                    if self.conversation.system_prompt:
+                        request_kwargs["system"] = self.conversation.system_prompt
+
+                    # Add tools if any are enabled
+                    tools = self._build_tools_list()
+                    if tools:
+                        request_kwargs["tools"] = tools
+
+                    # Add extended thinking if enabled (resolved once above, before the loop)
+                    if thinking_kwargs:
+                        request_kwargs["thinking"] = thinking_kwargs
+
+                    # Make streaming API call
+                    with self.client.messages.stream(**request_kwargs) as stream:
+                        response_text = ""
+                        thinking_text = ""
+                        in_thinking = False
+
+                        # Stream events to handle both thinking and text
+                        for event in stream:
+                            if hasattr(event, 'type'):
+                                if event.type == 'content_block_start':
+                                    block = getattr(event, 'content_block', None)
+                                    if block and getattr(block, 'type', None) == 'thinking':
+                                        in_thinking = True
+                                        print("[Thinking...] ", end="", flush=True)
+                                    elif block and getattr(block, 'type', None) == 'text':
+                                        in_thinking = False
+                                elif event.type == 'content_block_delta':
+                                    delta = getattr(event, 'delta', None)
+                                    if delta:
+                                        if getattr(delta, 'type', None) == 'thinking_delta':
+                                            thinking_text += getattr(delta, 'thinking', '')
+                                        elif getattr(delta, 'type', None) == 'text_delta':
+                                            text = getattr(delta, 'text', '')
+                                            print(text, end="", flush=True)
+                                            response_text += text
+                                elif event.type == 'content_block_stop':
+                                    if in_thinking:
+                                        print(f"[{len(thinking_text)} chars]", flush=True)
+                                        print("Claude: ", end="", flush=True)
+                                        in_thinking = False
+
+                        # Get the final message for metadata
+                        response = stream.get_final_message()
+
+                    self.stats['requests'] += 1
+
+                    # Update stats
+                    if hasattr(response, 'usage'):
+                        self._update_stats(response.usage)
+                        # Track per-turn totals for display
+                        turn_input_tokens += response.usage.input_tokens
+                        turn_output_tokens += response.usage.output_tokens
+                        turn_cache_creation += getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
+                        turn_cache_read += getattr(response.usage, 'cache_read_input_tokens', 0) or 0
+
+                    # A safety-classifier decline: HTTP 200 with stop_reason == "refusal",
+                    # not an exception. Any partial content already streamed is incomplete
+                    # per Anthropic's docs, so hand off to the recovery prompt instead of
+                    # silently storing it.
+                    if getattr(response, 'stop_reason', None) == 'refusal':
+                        refused = True
+                        break
+
+                    # Check for tool use
+                    tool_uses = []
+                    for block in response.content:
+                        if hasattr(block, 'type') and block.type == 'tool_use':
+                            tool_uses.append(block)
+
+                    # If no tool use, we're done
+                    if response.stop_reason != "tool_use" or not tool_uses:
+                        # Save assistant response to history
+                        # Always use _serialize_content to preserve thinking blocks
+                        self.conversation.messages.append({
+                            "role": "assistant",
+                            "content": self._serialize_content(response.content)
+                        })
+                        break
+
+                    # Handle tool use
+                    # First, save assistant's response with tool_use blocks
                     self.conversation.messages.append({
                         "role": "assistant",
                         "content": self._serialize_content(response.content)
                     })
-                    break
-                
-                # Handle tool use
-                # First, save assistant's response with tool_use blocks
-                self.conversation.messages.append({
-                    "role": "assistant",
-                    "content": self._serialize_content(response.content)
-                })
-                
-                # Execute each tool and collect results
-                tool_results = []
-                for tool_use in tool_uses:
-                    total_tool_calls += 1
-                    self.stats['tool_calls'] += 1
-                    
-                    # Show what tool is being called
-                    print(f"\n[Tool: {tool_use.name}({tool_use.input})]", flush=True)
-                    
-                    # Execute the tool
-                    if self.tool_executor:
-                        result = self.tool_executor.execute(tool_use.name, tool_use.input)
-                    else:
-                        result = f"Error: Tool executor not configured"
-                    
-                    
-                    # Check for excessive tool call rate
-                    # (removed: rate warning - escalating sleep handles this now)
-                    # Show abbreviated result
-                    if isinstance(result, list):
-                        result_preview = "[image]"
-                    else:
-                        result_preview = result[:100] + "..." if len(result) > 100 else result
-                    print(f"[Result: {result_preview}]", flush=True)
-                    
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.id,
-                        "content": result
+
+                    # Execute each tool and collect results
+                    tool_results = []
+                    for tool_use in tool_uses:
+                        total_tool_calls += 1
+                        self.stats['tool_calls'] += 1
+
+                        # Show what tool is being called
+                        print(f"\n[Tool: {tool_use.name}({tool_use.input})]", flush=True)
+
+                        # Execute the tool
+                        if self.tool_executor:
+                            result = self.tool_executor.execute(tool_use.name, tool_use.input)
+                        else:
+                            result = f"Error: Tool executor not configured"
+
+
+                        # Check for excessive tool call rate
+                        # (removed: rate warning - escalating sleep handles this now)
+                        # Show abbreviated result
+                        if isinstance(result, list):
+                            result_preview = "[image]"
+                        else:
+                            result_preview = result[:100] + "..." if len(result) > 100 else result
+                        print(f"[Result: {result_preview}]", flush=True)
+
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": result
+                        })
+
+                    # Add tool results as a user message
+                    self.conversation.messages.append({
+                        "role": "user",
+                        "content": tool_results
                     })
-                
-                # Add tool results as a user message
-                self.conversation.messages.append({
-                    "role": "user",
-                    "content": tool_results
-                })
-                
-                # Continue the loop - Claude will respond to tool results
-            
+
+                    # Continue the loop - Claude will respond to tool results
+
+                if not refused:
+                    break  # normal completion - fall through to final stats
+
+                # --- Handle the refusal: discard whatever this attempt appended
+                # (including any tool round trips earlier in this same turn) and
+                # let the user choose how to proceed. ---
+                action, new_content = self._prompt_refusal_recovery(
+                    response, user_content, response_text=response_text, thinking_text=thinking_text
+                )
+
+                if action == 'continue':
+                    self.conversation.messages.append({
+                        "role": "assistant",
+                        "content": self._serialize_content(response.content)
+                    })
+                    print("[Keeping the partial response above as the final answer for this turn.]")
+                    break
+
+                if action == 'edit':
+                    self.conversation.messages = self.conversation.messages[:rollback_point]
+                    user_content = new_content
+                    self.conversation.messages.append({"role": "user", "content": user_content})
+                    continue
+
+                if action == 'fallback':
+                    self.conversation.messages = self.conversation.messages[:rollback_point]
+                    self.conversation.messages.append({"role": "user", "content": user_content})
+                    self.conversation.model = "claude-opus-4-8"
+                    if self.tool_executor:
+                        self.tool_executor.model = self.conversation.model
+                    print("[Switching this conversation's model to claude-opus-4-8 and retrying.]")
+                    continue
+
+                # action == 'cancel'
+                self.conversation.messages = self.conversation.messages[:rollback_point]
+                print("Cancelled — message not sent.")
+                return
+
             # Show final stats
             if hasattr(response, 'usage'):
                 # Context size = input_tokens + cache_read (cache_read is part of context but billed differently)
                 cache_read = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
                 context_size = response.usage.input_tokens + cache_read
-                
+
                 cache_info = ""
                 if turn_cache_creation > 0:
                     cache_info = f", cache write: {turn_cache_creation:,}"
                 elif turn_cache_read > 0:
                     cache_info = f", cache read: {turn_cache_read:,}"
-                
+
                 web_info = ""
                 server_tool_use = getattr(response.usage, 'server_tool_use', None)
                 if server_tool_use and getattr(server_tool_use, 'web_search_requests', 0):
                     web_info = f", web: {server_tool_use.web_search_requests}"
-                
+
                 tools_info = ""
                 if total_tool_calls > 0:
                     tools_info = f", tools: {total_tool_calls}"
-                
+
                 # Show context size (how close to 200k limit) and output tokens
                 print(f"\n[ctx: {context_size:,}, out: {turn_output_tokens:,}{cache_info}{web_info}{tools_info}, stop: {response.stop_reason}]")
-        
+
         except Exception as e:
             print(f"\nError: {e}")
             import traceback
