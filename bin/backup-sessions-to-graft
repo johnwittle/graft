@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+Sync Claude Code sessions into a directory of named graft conversations.
+
+Scans ~/.claude/projects/*/*.jsonl, converts any new or grown session into
+graft format (via claude-session-to-graft), and drops the result into
+~/claudecode-backup-sessions/ with a human-readable filename:
+
+    2026-07-11-debug-graft-thinking-block-modification-error-55e5bd8b.json
+
+Names come from the session's latest ai-title event, falling back to the
+first user prompt, falling back to the session id. A .manifest.json in the
+destination tracks (size, mtime) of each converted source so unchanged
+sessions are skipped; a session that grew is reconverted and its previous
+output replaced (even if its title changed in the meantime).
+
+Designed to run from cron. Idempotent, quiet when there's nothing to do.
+The destination dir is meant to be rsync'd elsewhere for safekeeping and
+imported into graft at leisure.
+"""
+
+import importlib.util
+import json
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+SOURCE_ROOT = Path.home() / '.claude' / 'projects'
+DEST = Path.home() / 'claudecode-backup-sessions'
+MANIFEST_PATH = DEST / '.manifest.json'
+BIN_DIR = Path(__file__).resolve().parent
+
+# The converter lives next to this script and has no .py extension, so we
+# need an explicit SourceFileLoader; this reuses its extraction logic
+# (including sidechain filtering and tool_use/tool_result repair).
+from importlib.machinery import SourceFileLoader
+_loader = SourceFileLoader(
+    'claude_session_to_graft', str(BIN_DIR / 'claude-session-to-graft'))
+_spec = importlib.util.spec_from_loader('claude_session_to_graft', _loader)
+_converter = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_converter)
+
+
+def slugify(text, max_len=60):
+    slug = re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+    if len(slug) > max_len:
+        slug = slug[:max_len].rsplit('-', 1)[0] or slug[:max_len]
+    return slug
+
+
+def session_label(events, session_id):
+    """Best available human-readable label for a session."""
+    # Latest ai-title event wins (titles are regenerated as sessions evolve)
+    title = None
+    for e in events:
+        if e.get('type') == 'ai-title' and e.get('aiTitle'):
+            title = e['aiTitle']
+    if title:
+        return slugify(title)
+    # Fall back to the first real user prompt
+    for e in events:
+        if e.get('type') == 'user' and not e.get('isSidechain') and not e.get('isMeta'):
+            content = e.get('message', {}).get('content', '')
+            if isinstance(content, list):
+                content = ' '.join(
+                    b.get('text', '') for b in content
+                    if isinstance(b, dict) and b.get('type') == 'text')
+            if isinstance(content, str) and content.strip() and not content.startswith('<'):
+                words = slugify(content, max_len=48)
+                if words:
+                    return words
+    return session_id[:8]
+
+
+def convert(src, session_id):
+    """Convert one session file. Returns (filename, graft_dict) or None."""
+    events = list(_converter.parse_jsonl(src))
+    if not events:
+        return None
+    messages = _converter.extract_messages(events)
+    if not messages:
+        return None  # nothing conversational in this session
+    metadata = _converter.extract_metadata(events)
+
+    label = session_label(events, session_id)
+    start = metadata.get('start_time') or datetime.now().isoformat()
+    date = start[:10]
+    filename = f"{date}-{label}-{session_id[:8]}.json"
+
+    graft_conv = {
+        'name': f"{date}-{label}",
+        'created': metadata.get('start_time') or start,
+        'modified': metadata.get('end_time') or start,
+        'model': metadata.get('model', 'claude-fable-5'),
+        'system_prompt': (
+            "[Imported from Claude Code session]\n"
+            f"[Original CWD: {metadata.get('cwd', 'unknown')}]\n"
+            f"[Session ID: {metadata.get('session_id') or session_id}]"
+        ),
+        'messages': messages,
+        'web_search': False,
+        'tools_path': None,
+        'shell_enabled': True,
+    }
+    return filename, graft_conv
+
+
+def main():
+    DEST.mkdir(parents=True, exist_ok=True)
+    manifest = {}
+    if MANIFEST_PATH.exists():
+        try:
+            manifest = json.loads(MANIFEST_PATH.read_text())
+        except json.JSONDecodeError:
+            print("warning: manifest unreadable, rebuilding", file=sys.stderr)
+
+    sources = sorted(SOURCE_ROOT.glob('*/*.jsonl'))
+    converted = skipped = failed = 0
+
+    for src in sources:
+        session_id = src.stem
+        stat = src.stat()
+        entry = manifest.get(session_id)
+        if entry and entry.get('src_size') == stat.st_size \
+                and entry.get('src_mtime') == stat.st_mtime:
+            skipped += 1
+            continue
+
+        try:
+            result = convert(src, session_id)
+        except Exception as e:
+            print(f"error converting {src.name}: {e}", file=sys.stderr)
+            failed += 1
+            continue
+        if result is None:
+            # Nothing conversational; remember that so we don't retry forever
+            manifest[session_id] = {
+                'src_size': stat.st_size, 'src_mtime': stat.st_mtime,
+                'output': None,
+            }
+            continue
+
+        filename, graft_conv = result
+        # If this session was converted before under a different name
+        # (title changed as the session grew), remove the stale output.
+        old = entry.get('output') if entry else None
+        if old and old != filename and (DEST / old).exists():
+            (DEST / old).unlink()
+
+        (DEST / filename).write_text(json.dumps(graft_conv, indent=2))
+        manifest[session_id] = {
+            'src_size': stat.st_size, 'src_mtime': stat.st_mtime,
+            'output': filename,
+            'messages': len(graft_conv['messages']),
+            'converted_at': datetime.now().isoformat(timespec='seconds'),
+        }
+        converted += 1
+        print(f"{'updated' if entry else 'new'}: {filename} "
+              f"({len(graft_conv['messages'])} messages)")
+
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2))
+    if converted or failed:
+        print(f"done: {converted} converted, {skipped} unchanged, {failed} failed "
+              f"[{datetime.now().isoformat(timespec='seconds')}]")
+
+
+if __name__ == '__main__':
+    main()

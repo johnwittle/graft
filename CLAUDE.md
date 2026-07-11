@@ -3,6 +3,17 @@
 Single-file personal conversation harness for the Anthropic API: `graft.py`.
 Conversations persist as JSON under `~/.graft/conversations/`.
 
+## Session backup pipeline
+
+`bin/backup-sessions-to-graft` converts Claude Code sessions
+(`~/.claude/projects/*/*.jsonl`) into named graft conversations in
+`~/claudecode-backup-sessions/`, which John rsyncs to his home machine.
+It runs every 30 minutes via a systemd user timer
+(`~/.config/systemd/user/graft-session-backup.{service,timer}`, linger
+enabled); logs at `~/.graft/backup-sessions.log`. Filenames come from each
+session's latest `ai-title` event. A `.manifest.json` in the destination
+tracks source size/mtime so only new or grown sessions are reconverted.
+
 ## Serialization is sacred
 
 Assistant response content must round-trip **verbatim**. `_serialize_content`
