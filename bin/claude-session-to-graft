@@ -43,7 +43,14 @@ def extract_messages(events):
     for event in events:
         event_type = event.get('type')
         uuid = event.get('uuid')
-        
+
+        # Skip sidechain events (subagent transcripts from the Agent tool).
+        # They interleave with the main conversation in the JSONL but belong
+        # to separate conversations; importing them corrupts turn alternation
+        # and tool_use/tool_result pairing.
+        if event.get('isSidechain'):
+            continue
+
         if event_type == 'user':
             msg = event.get('message', {})
             content = msg.get('content', '')
@@ -110,8 +117,83 @@ def extract_messages(events):
                 
         elif event_type == 'tool_result':
             messages.append({'role': 'user', 'content': data})
-    
-    return messages
+
+    return repair_tool_pairing(messages)
+
+
+def repair_tool_pairing(messages):
+    """
+    Ensure every tool_use block is answered by a matching tool_result in the
+    next message, synthesizing placeholders where the session log is missing
+    them (interrupted sessions, API-error turns). The API rejects any request
+    containing an unanswered tool_use, which would make the import unsendable.
+
+    We synthesize rather than delete: removing a tool_use block from an
+    assistant message that also carries thinking blocks would alter the
+    signed thinking-block sequence, and the API rejects modified sequences
+    on the latest assistant message ("thinking ... cannot be modified").
+    """
+    def synthetic_result(tool_use_id):
+        return {
+            'type': 'tool_result',
+            'tool_use_id': tool_use_id,
+            'content': '[tool result not recorded in session log '
+                       '(session interrupted or result lost); '
+                       'synthesized on import]'
+        }
+
+    repaired = []
+    for i, msg in enumerate(messages):
+        repaired.append(msg)
+        content = msg.get('content')
+        if msg.get('role') != 'assistant' or not isinstance(content, list):
+            continue
+        pending = [
+            b['id'] for b in content
+            if isinstance(b, dict) and b.get('type') == 'tool_use'
+        ]
+        if not pending:
+            continue
+
+        # Results for parallel tool calls arrive as SEPARATE consecutive user
+        # messages in the session log (one tool_result each). The API merges
+        # consecutive same-role messages, so that shape is valid — collect
+        # answered ids across the whole run of user messages that follows,
+        # not just the first one.
+        run = []
+        j = i + 1
+        while j < len(messages) and messages[j].get('role') == 'user':
+            run.append(messages[j])
+            j += 1
+        answered = {
+            b.get('tool_use_id')
+            for m in run if isinstance(m.get('content'), list)
+            for b in m['content']
+            if isinstance(b, dict) and b.get('type') == 'tool_result'
+        }
+        missing = [tid for tid in pending if tid not in answered]
+        if not missing:
+            continue
+        first_result_msg = next(
+            (m for m in run if isinstance(m.get('content'), list)
+             and any(isinstance(b, dict) and b.get('type') == 'tool_result'
+                     for b in m['content'])),
+            None
+        )
+        if first_result_msg is not None:
+            # Partial results exist: fill in the gaps alongside them.
+            # (This message is appended to `repaired` on a later iteration;
+            # mutate its content list now, before that happens.)
+            first_result_msg['content'] = list(first_result_msg['content']) + [
+                synthetic_result(tid) for tid in missing
+            ]
+        else:
+            # No tool_result message follows at all: insert a synthetic one.
+            repaired.append({
+                'role': 'user',
+                'content': [synthetic_result(tid) for tid in missing]
+            })
+    return repaired
 
 
 def extract_metadata(events):
@@ -126,6 +208,8 @@ def extract_metadata(events):
     }
     
     for event in events:
+        if event.get('isSidechain'):
+            continue  # subagent events; may even report a different model
         if event.get('sessionId') and not metadata['session_id']:
             metadata['session_id'] = event['sessionId']
         if event.get('cwd') and not metadata['cwd']:
