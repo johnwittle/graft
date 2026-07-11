@@ -505,6 +505,48 @@ def strip_unsigned_thinking_blocks(messages):
     return result
 
 
+def strip_broken_trailing_thinking(messages):
+    """
+    Work around assistant messages mangled by the old _serialize_content,
+    which dropped server-tool blocks (server_tool_use / web_search_tool_result)
+    while keeping the thinking blocks around them. The API validates the
+    thinking-block sequence of the LATEST assistant message on every request,
+    so such a message is fine anywhere in history but 400s
+    ("thinking ... cannot be modified") the moment it is the most recent
+    assistant turn — including after a rewind.
+
+    Detection: a genuine response never has two thinking blocks directly
+    adjacent (interleaved thinking always has tool/text blocks between them),
+    so adjacent thinking blocks mean something was removed. In that case we
+    drop the thinking blocks from the message at send time — thinking blocks
+    are optional on input, and storage is left untouched. Messages ending in
+    tool_use (an in-flight tool loop, where thinking MUST be preserved) are
+    never touched; those are serialized faithfully.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get('role') != 'assistant':
+            continue
+        content = messages[i].get('content')
+        if not isinstance(content, list) or not content:
+            return messages
+        if isinstance(content[-1], dict) and content[-1].get('type') == 'tool_use':
+            return messages  # mid tool loop: leave thinking intact
+        adjacent_thinking = any(
+            isinstance(a, dict) and isinstance(b, dict)
+            and a.get('type') == 'thinking' and b.get('type') == 'thinking'
+            for a, b in zip(content, content[1:])
+        )
+        if adjacent_thinking:
+            cleaned = [
+                b for b in content
+                if not (isinstance(b, dict) and b.get('type') == 'thinking')
+            ]
+            messages = list(messages)
+            messages[i] = {'role': 'assistant', 'content': cleaned}
+        return messages
+    return messages
+
+
 def prepare_messages_for_cache(messages, cache_ttl="5m"):
     """
     Convert messages to cacheable format.
@@ -512,6 +554,9 @@ def prepare_messages_for_cache(messages, cache_ttl="5m"):
     """
     # Strip thinking blocks without valid signatures (e.g., from imports)
     messages = strip_unsigned_thinking_blocks(messages)
+    # Drop thinking blocks from a latest-assistant-message that was mangled
+    # by the old serializer (see strip_broken_trailing_thinking docstring)
+    messages = strip_broken_trailing_thinking(messages)
     
     if cache_ttl == "off" or len(messages) < 2:
         return messages
@@ -1779,30 +1824,29 @@ Output the compressed transcript now. Start with [Context: ...] if helpful."""
     def _serialize_content(self, content_blocks):
         """
         Serialize response content blocks for storage in messages.
-        Converts API objects to dicts that can be JSON serialized.
-        Preserves thinking blocks for multi-turn continuity.
+        Converts API objects to plain dicts that can be JSON serialized.
+
+        Faithful by design: EVERY block type is preserved verbatim —
+        thinking (with signature), text (with citations), tool_use, and
+        server-tool blocks like server_tool_use / web_search_tool_result,
+        plus redacted_thinking and anything added in the future.
+
+        This matters for correctness, not just completeness: the API
+        cryptographically validates the thinking-block sequence of the
+        latest assistant message when it is sent back. Dropping blocks
+        that sat between thinking blocks (as an older version of this
+        method did with web-search blocks) makes the API reject the next
+        request with "`thinking` or `redacted_thinking` blocks in the
+        latest assistant message cannot be modified".
         """
         serialized = []
         for block in content_blocks:
-            if hasattr(block, 'type') and block.type == 'thinking':
-                # Preserve thinking blocks - required for multi-turn with extended thinking
-                thinking_block = {
-                    "type": "thinking", 
-                    "thinking": getattr(block, 'thinking', '')
-                }
-                sig = getattr(block, 'signature', None)
-                if sig:
-                    thinking_block['signature'] = sig
-                serialized.append(thinking_block)
-            elif hasattr(block, 'text'):
-                serialized.append({"type": "text", "text": block.text})
-            elif hasattr(block, 'type') and block.type == 'tool_use':
-                serialized.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input
-                })
+            if isinstance(block, dict):
+                serialized.append(block)
+            else:
+                # Anthropic SDK content blocks are pydantic models;
+                # model_dump round-trips them exactly as the API sent them.
+                serialized.append(block.model_dump(mode='json', exclude_none=True))
         return serialized
     
     def _prompt_refusal_recovery(self, response, user_content, response_text='', thinking_text=''):
