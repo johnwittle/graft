@@ -26,6 +26,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Bump when the output format changes (e.g. system prompt contents) so that
+# already-converted sessions are regenerated on the next run.
+FORMAT = 2
+
 SOURCE_ROOT = Path.home() / '.claude' / 'projects'
 DEST = Path.home() / 'claudecode-backup-sessions'
 MANIFEST_PATH = DEST / '.manifest.json'
@@ -93,11 +97,8 @@ def convert(src, session_id):
         'created': metadata.get('start_time') or start,
         'modified': metadata.get('end_time') or start,
         'model': metadata.get('model', 'claude-fable-5'),
-        'system_prompt': (
-            "[Imported from Claude Code session]\n"
-            f"[Original CWD: {metadata.get('cwd', 'unknown')}]\n"
-            f"[Session ID: {metadata.get('session_id') or session_id}]"
-        ),
+        'system_prompt': _converter.build_system_prompt(
+            metadata, session_id=session_id),
         'messages': messages,
         'web_search': False,
         'tools_path': None,
@@ -123,7 +124,8 @@ def main():
         stat = src.stat()
         entry = manifest.get(session_id)
         if entry and entry.get('src_size') == stat.st_size \
-                and entry.get('src_mtime') == stat.st_mtime:
+                and entry.get('src_mtime') == stat.st_mtime \
+                and entry.get('format') == FORMAT:
             skipped += 1
             continue
 
@@ -137,7 +139,7 @@ def main():
             # Nothing conversational; remember that so we don't retry forever
             manifest[session_id] = {
                 'src_size': stat.st_size, 'src_mtime': stat.st_mtime,
-                'output': None,
+                'output': None, 'format': FORMAT,
             }
             continue
 
@@ -154,6 +156,7 @@ def main():
             'output': filename,
             'messages': len(graft_conv['messages']),
             'converted_at': datetime.now().isoformat(timespec='seconds'),
+            'format': FORMAT,
         }
         converted += 1
         print(f"{'updated' if entry else 'new'}: {filename} "

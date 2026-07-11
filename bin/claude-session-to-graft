@@ -230,6 +230,36 @@ def extract_metadata(events):
     return metadata
 
 
+def build_system_prompt(metadata, session_id=None, converted_at=None):
+    """
+    System prompt for imported conversations: provenance, plus the two things
+    an imported model actually needs on arrival (learned by asking one):
+
+    - where the Claude Code log ends, so the seam between harnesses is dated
+      rather than something to infer from conversational vibes;
+    - a warning that its tool-calling habits are stale, since the history is
+      full of Claude Code tools (Bash, Read, Edit, ...) that don't exist in
+      graft's environment.
+    """
+    lines = [
+        "[Imported from Claude Code session]",
+        f"[Original CWD: {metadata.get('cwd', 'unknown')}]",
+        f"[Session ID: {metadata.get('session_id') or session_id or 'unknown'}]",
+    ]
+    stamp = converted_at or datetime.now().isoformat(timespec='seconds')
+    ended = metadata.get('end_time')
+    if ended:
+        lines.append(f"[Claude Code log ends: {ended}; converted to graft: {stamp}]")
+    else:
+        lines.append(f"[Converted to graft: {stamp}]")
+    lines.append(
+        "[Note: tool_use blocks in the imported history reference Claude Code's "
+        "tools (Bash, Read, Write, Edit, ...). The tools available here are "
+        "different — trust your current tool definitions, not habit.]"
+    )
+    return "\n".join(lines)
+
+
 def convert_session(input_path, output_path=None):
     """Convert Claude Code session to graft format."""
     events = list(parse_jsonl(input_path))
@@ -256,7 +286,7 @@ def convert_session(input_path, output_path=None):
         'created': metadata.get('start_time', now),
         'modified': metadata.get('end_time', now),
         'model': metadata.get('model', 'claude-sonnet-4-5-20250929'),
-        'system_prompt': f"[Imported from Claude Code session]\n[Original CWD: {metadata.get('cwd', 'unknown')}]\n[Session ID: {metadata.get('session_id', 'unknown')}]",
+        'system_prompt': build_system_prompt(metadata),
         'messages': messages,
         'web_search': False,
         'tools_path': None,
