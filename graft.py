@@ -699,13 +699,23 @@ def native_image_cap(model):
 def model_thinking_style(model):
     """How a model expects the `thinking` request param to be shaped.
 
-    'always_on'     - thinking cannot be turned off (Fable/Mythos); adaptive only.
+    'always_on'     - thinking cannot be turned off; adaptive only (Fable/Mythos,
+                      and, going forward, the default assumption for any model
+                      graft doesn't otherwise recognize — see the note below).
     'adaptive_only' - adaptive thinking only; `budget_tokens` is rejected (400).
     'dual'          - supports BOTH: adaptive (recommended) and the deprecated-but-
                       functional `{"type": "enabled", "budget_tokens": N}` escape hatch
                       (Opus 4.6, Sonnet 4.6).
     'legacy'        - pre-4.6 models: only the `enabled` + `budget_tokens` shape exists;
                       adaptive isn't available at all.
+
+    The fallback for a model matching none of the explicit patterns below is
+    'always_on', not 'legacy'. Mandated adaptive thinking (no way to disable it,
+    no literal budget) looks like the direction new model releases are heading
+    (Fable/Mythos, then Opus 5.5) rather than an exception, so an unrecognized
+    *new* model should be assumed to work that way until proven otherwise.
+    Genuinely old models are matched explicitly below and always resolve to
+    'legacy' regardless of this fallback.
     """
     m = (model or "").lower()
     if any(t in m for t in ("fable", "mythos")):
@@ -714,7 +724,13 @@ def model_thinking_style(model):
         return "dual"
     if any(t in m for t in ("opus-4-7", "opus-4-8", "opus-4.7", "opus-4.8", "sonnet-5")):
         return "adaptive_only"
-    return "legacy"
+    if any(t in m for t in (
+        "opus-4-5", "opus-4.5", "opus-4-1", "opus-4.1", "opus-4-0", "opus-4.0", "opus-4",
+        "sonnet-4-5", "sonnet-4.5", "sonnet-4-0", "sonnet-4.0", "sonnet-4",
+        "opus-3", "sonnet-3", "haiku", "claude-3",
+    )):
+        return "legacy"
+    return "always_on"
 
 
 def resolve_thinking_request(model, thinking_mode, thinking_budget):
